@@ -46,10 +46,13 @@ pub enum Counter {
     ObjectsInstantiated,
     /// Bitmaps decoded from their compressed SWF representation.
     BitmapsDecoded,
+    /// Layer blend groups rendered inline instead of through an offscreen
+    /// target (see `render_base`).
+    LayerBlendsInlined,
 }
 
 impl Counter {
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
 
     pub const NAMES: [&'static str; Self::COUNT] = [
         "display_objects",
@@ -60,6 +63,7 @@ impl Counter {
         "text_layouts",
         "objects_instantiated",
         "bitmaps_decoded",
+        "layer_blends_inlined",
     ];
 }
 
