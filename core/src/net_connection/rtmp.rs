@@ -527,6 +527,76 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "shararam_profiler")]
+    #[test]
+    fn profiler_records_rtmp_send_and_recv() {
+        use crate::profiler;
+        // The profiler buffer is thread-local, so this test only sees its own
+        // events. Clear anything left over, then drive a full round-trip.
+        let _ = profiler::drain_json();
+
+        let mut connection = connection();
+        let socket = socket_handle();
+        // Handshake completion encodes and "sends" the connect command.
+        let _connect = complete_handshake(&mut connection, socket);
+
+        // Server accepts the connection.
+        let result = Command::new(
+            "_result".into(),
+            TransactionId::CONNECT,
+            Rc::new(AmfValue::Null),
+            vec![Rc::new(AmfValue::Object(
+                ObjectId::INVALID,
+                vec![element(
+                    "code",
+                    AmfValue::String("NetConnection.Connect.Success".into()),
+                )],
+                None,
+            ))],
+        );
+        connection.handle_transport_event(RtmpTransportEvent::Data(server_command(result)), 10);
+
+        // Server invokes a client method with an argument.
+        let invoke = Command::new(
+            "serverPing".into(),
+            TransactionId::NOTIFICATION,
+            Rc::new(AmfValue::Null),
+            vec![Rc::new(AmfValue::Number(7.0))],
+        );
+        connection.handle_transport_event(RtmpTransportEvent::Data(server_command(invoke)), 11);
+
+        // Client sends a notification back.
+        connection.send(
+            "clientPong".into(),
+            None,
+            vec![Rc::new(AmfValue::String("hi".into()))],
+            12,
+        );
+
+        let json = profiler::drain_json();
+        let events: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let events = events.as_array().expect("array");
+        let find = |name: &str, method: &str| {
+            events.iter().find(|event| {
+                event["c"] == "rtmp" && event["n"] == name && event["a"]["method"] == method
+            })
+        };
+
+        let connect = find("send", "connect").expect("connect send recorded");
+        assert_eq!(connect["a"]["kind"], "connect");
+
+        let connect_result = find("recv", "_result").expect("connect result recorded");
+        assert_eq!(connect_result["a"]["kind"], "connect_result");
+
+        let ping = find("recv", "serverPing").expect("server invoke recorded");
+        assert_eq!(ping["a"]["kind"], "notify");
+        assert_eq!(ping["a"]["args"][0], 7);
+
+        let pong = find("send", "clientPong").expect("client notification recorded");
+        assert_eq!(pong["a"]["kind"], "notify");
+        assert_eq!(pong["a"]["args"][0], "hi");
+    }
+
     #[test]
     fn remote_call_result_uses_the_server_transaction_id() {
         let mut connection = connection();
