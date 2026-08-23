@@ -24,11 +24,87 @@ use std::num::NonZeroU32;
 
 pub struct ProfiledRenderer {
     inner: Box<dyn RenderBackend>,
+    debug_info_reported: bool,
 }
 
 impl ProfiledRenderer {
     pub fn new(inner: Box<dyn RenderBackend>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            debug_info_reported: false,
+        }
+    }
+}
+
+/// Per-frame breakdown of the command tree. Offscreen-heavy constructs
+/// (`Blend`, `RenderAlphaMask`) are the interesting part: in the wgpu
+/// backend each costs full-target-sized intermediate textures per frame.
+#[derive(Default)]
+struct CommandStats {
+    shapes: u32,
+    bitmaps: u32,
+    rects: u32,
+    stencil_masks: u32,
+    alpha_masks: u32,
+    blend_layer: u32,
+    blend_alpha_erase: u32,
+    blend_complex: u32,
+    blend_shader: u32,
+    max_depth: u32,
+}
+
+impl CommandStats {
+    fn json_fields(&self) -> String {
+        format!(
+            "\"shapes\":{},\"bitmaps\":{},\"rects\":{},\"stencil_masks\":{},\"alpha_masks\":{},\"blend_layer\":{},\"blend_alpha_erase\":{},\"blend_complex\":{},\"blend_shader\":{},\"max_depth\":{}",
+            self.shapes,
+            self.bitmaps,
+            self.rects,
+            self.stencil_masks,
+            self.alpha_masks,
+            self.blend_layer,
+            self.blend_alpha_erase,
+            self.blend_complex,
+            self.blend_shader,
+            self.max_depth
+        )
+    }
+}
+
+fn walk_commands(list: &CommandList, depth: u32, stats: &mut CommandStats) {
+    use ruffle_render::commands::{Command, RenderBlendMode};
+    if depth > stats.max_depth {
+        stats.max_depth = depth;
+    }
+    for command in &list.commands {
+        match command {
+            Command::RenderShape { .. } => stats.shapes += 1,
+            Command::RenderBitmap { .. } | Command::RenderStage3D { .. } => stats.bitmaps += 1,
+            Command::DrawRect { .. } | Command::DrawLine { .. } | Command::DrawLineRect { .. } => {
+                stats.rects += 1
+            }
+            Command::PushMask => stats.stencil_masks += 1,
+            Command::ActivateMask | Command::DeactivateMask | Command::PopMask => {}
+            Command::RenderAlphaMask {
+                maskee_commands,
+                mask_commands,
+            } => {
+                stats.alpha_masks += 1;
+                walk_commands(maskee_commands, depth + 1, stats);
+                walk_commands(mask_commands, depth + 1, stats);
+            }
+            Command::Blend(inner, mode) => {
+                match mode {
+                    RenderBlendMode::Builtin(swf::BlendMode::Layer) => stats.blend_layer += 1,
+                    RenderBlendMode::Builtin(
+                        swf::BlendMode::Alpha | swf::BlendMode::Erase,
+                    ) => stats.blend_alpha_erase += 1,
+                    RenderBlendMode::Builtin(_) => stats.blend_complex += 1,
+                    RenderBlendMode::Shader(_) => stats.blend_shader += 1,
+                }
+                walk_commands(inner, depth + 1, stats);
+            }
+        }
     }
 }
 
@@ -166,15 +242,25 @@ impl RenderBackend for ProfiledRenderer {
         commands: CommandList,
         cache_entries: Vec<BitmapCacheEntry>,
     ) {
+        if !self.debug_info_reported {
+            self.debug_info_reported = true;
+            let info = self.inner.debug_info().replace(['\n', '"'], " ");
+            crate::profiler::instant("render", "debug_info", || {
+                format!("{{\"info\":{}}}", crate::profiler::json_str(&info))
+            });
+        }
         let _span = span("render", "submit_frame").args(|| {
+            let mut stats = CommandStats::default();
+            walk_commands(&commands, 0, &mut stats);
             let cache_commands: usize = cache_entries
                 .iter()
                 .map(|entry| entry.commands.commands.len())
                 .sum();
             format!(
-                "{{\"commands\":{},\"cache_entries\":{},\"cache_commands\":{cache_commands}}}",
+                "{{\"commands\":{},\"cache_entries\":{},\"cache_commands\":{cache_commands},{}}}",
                 commands.commands.len(),
-                cache_entries.len()
+                cache_entries.len(),
+                stats.json_fields()
             )
         });
         self.inner.submit_frame(clear, commands, cache_entries)
