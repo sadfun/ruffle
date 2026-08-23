@@ -260,9 +260,11 @@ impl<'gc> MovieLibrary<'gc> {
         character: Character<'gc>,
         mc: &Mutation<'gc>,
     ) -> Option<DisplayObject<'gc>> {
+        crate::profiler::inc(crate::profiler::Counter::ObjectsInstantiated);
         match character {
             Character::Bitmap(bitmap) => {
                 let avm2_class = bitmap.avm2_class();
+                let _movie_scope = crate::profiler::movie_scope(self.swf.clone());
                 let bitmap = bitmap.compressed().decode().unwrap();
                 let bitmap = Bitmap::new(mc, id, bitmap, self.swf.clone());
                 bitmap.set_avm2_bitmapdata_class(mc, avm2_class);

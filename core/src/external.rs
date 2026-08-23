@@ -37,6 +37,53 @@ impl From<AvmString<'_>> for Value {
     }
 }
 
+/// Renders ExternalInterface values as JSON for the profiler (bounded size).
+#[cfg_attr(not(feature = "shararam_profiler"), allow(dead_code))]
+fn profiler_values_json(values: &[Value]) -> String {
+    fn write(out: &mut String, value: &Value, depth: usize) {
+        use std::fmt::Write as _;
+        if out.len() > 8 * 1024 || depth > 12 {
+            out.push_str("\"…\"");
+            return;
+        }
+        match value {
+            Value::Undefined => out.push_str("\"undefined\""),
+            Value::Null => out.push_str("null"),
+            Value::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+            Value::Number(value) if value.is_finite() => {
+                let _ = write!(out, "{value}");
+            }
+            Value::Number(_) => out.push_str("null"),
+            Value::String(value) => out.push_str(&crate::profiler::json_str_truncated(value, 2048)),
+            Value::Object(members) => {
+                out.push('{');
+                for (index, (key, value)) in members.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&crate::profiler::json_str(key));
+                    out.push(':');
+                    write(out, value, depth + 1);
+                }
+                out.push('}');
+            }
+            Value::List(values) => {
+                out.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    write(out, value, depth + 1);
+                }
+                out.push(']');
+            }
+        }
+    }
+    let mut out = String::with_capacity(64);
+    write(&mut out, &Value::List(values.to_vec()), 0);
+    out
+}
+
 impl From<String> for Value {
     fn from(string: String) -> Self {
         Value::String(string)
@@ -285,6 +332,14 @@ impl<'gc> Callback<'gc> {
         name: &str,
         args: impl IntoIterator<Item = Value>,
     ) -> Value {
+        let args: Vec<Value> = args.into_iter().collect();
+        let _span = crate::profiler::span("external", "call_in").args(|| {
+            format!(
+                "{{\"name\":{},\"args\":{}}}",
+                crate::profiler::json_str(name),
+                profiler_values_json(&args)
+            )
+        });
         match self {
             Callback::Avm1 { this, method } => {
                 if let Some(base_clip) = context.stage.root_clip() {
@@ -405,6 +460,13 @@ impl<'gc> ExternalInterface<'gc> {
     }
 
     pub fn call_method(context: &mut UpdateContext<'gc>, name: &str, args: &[Value]) -> Value {
+        let _span = crate::profiler::span("external", "call_out").args(|| {
+            format!(
+                "{{\"name\":{},\"args\":{}}}",
+                crate::profiler::json_str(name),
+                profiler_values_json(args)
+            )
+        });
         let provider = context.external_interface.provider.clone();
         if let Some(provider) = &provider {
             provider.call_method(context, name, args)

@@ -525,6 +525,13 @@ impl NavigatorBackend for WebNavigatorBackend {
             }
         };
         tracing::info!("Connecting to {}", proxy_url);
+        ruffle_core::profiler::instant("rtmp", "socket_open", || {
+            format!(
+                "{{\"host\":{},\"port\":{port},\"proxy\":{}}}",
+                ruffle_core::profiler::json_str(&host),
+                ruffle_core::profiler::json_str(&proxy_url)
+            )
+        });
 
         let ws = match WebSocket::open(&proxy_url) {
             Ok(x) => x,

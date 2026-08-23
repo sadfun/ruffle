@@ -1,4 +1,5 @@
 use super::{ResponderCallback, ResponderHandle};
+use crate::profiler;
 use crate::rtmp::{Command, RtmpSession, SessionAction, TransactionId};
 use crate::socket::SocketHandle;
 use flash_lso::types::{Element, ObjectId, Value as AmfValue};
@@ -176,6 +177,12 @@ impl RtmpConnection {
     ) -> Vec<RtmpConnectionAction> {
         match event {
             RtmpTransportEvent::Connected(socket) => {
+                profiler::instant("rtmp", "transport", || {
+                    format!(
+                        "{{\"state\":\"connected\",\"uri\":{}}}",
+                        profiler::json_str(&self.uri)
+                    )
+                });
                 self.socket = Some(socket);
                 self.initial_handshake
                     .take()
@@ -184,6 +191,12 @@ impl RtmpConnection {
                     .collect()
             }
             RtmpTransportEvent::Failed(socket) => {
+                profiler::instant("rtmp", "transport", || {
+                    format!(
+                        "{{\"state\":\"failed\",\"uri\":{}}}",
+                        profiler::json_str(&self.uri)
+                    )
+                });
                 self.connected = false;
                 self.socket = None;
                 vec![
@@ -192,22 +205,35 @@ impl RtmpConnection {
                 ]
             }
             RtmpTransportEvent::Closed => {
+                profiler::instant("rtmp", "transport", || {
+                    format!(
+                        "{{\"state\":\"closed\",\"uri\":{}}}",
+                        profiler::json_str(&self.uri)
+                    )
+                });
                 self.socket = None;
                 self.connected = false;
                 vec![RtmpConnectionAction::Closed]
             }
-            RtmpTransportEvent::Data(bytes) => match self.session.receive(&bytes, receive_time) {
-                Ok(actions) => self.handle_session_actions(actions),
-                Err(error) => {
-                    tracing::warn!(error = %error, "RTMP session rejected peer data");
-                    self.connected = false;
-                    let mut actions = vec![RtmpConnectionAction::ConnectFailed(None)];
-                    if let Some(socket) = self.socket.take() {
-                        actions.push(RtmpConnectionAction::CloseSocket(socket));
+            RtmpTransportEvent::Data(bytes) => {
+                let received = {
+                    let _span = profiler::span("rtmp", "data_in")
+                        .args(|| format!("{{\"bytes\":{}}}", bytes.len()));
+                    self.session.receive(&bytes, receive_time)
+                };
+                match received {
+                    Ok(actions) => self.handle_session_actions(actions),
+                    Err(error) => {
+                        tracing::warn!(error = %error, "RTMP session rejected peer data");
+                        self.connected = false;
+                        let mut actions = vec![RtmpConnectionAction::ConnectFailed(None)];
+                        if let Some(socket) = self.socket.take() {
+                            actions.push(RtmpConnectionAction::CloseSocket(socket));
+                        }
+                        actions
                     }
-                    actions
                 }
-            },
+            }
         }
     }
 
@@ -222,6 +248,7 @@ impl RtmpConnection {
                 }
                 SessionAction::HandshakeComplete => {
                     tracing::debug!("RTMP handshake completed");
+                    profiler::mark("rtmp", "handshake_complete");
                     if let Some(command) = self.connect_command.take() {
                         let action = self.encode_command(&command, 0);
                         // Flash starts the first post-connect command with a
@@ -248,6 +275,26 @@ impl RtmpConnection {
 
     fn handle_command(&mut self, command: Command, output: &mut Vec<RtmpConnectionAction>) {
         let transaction_id = command.transaction_id;
+        profiler::instant("rtmp", "recv", || {
+            let kind = if transaction_id == TransactionId::CONNECT {
+                "connect_result"
+            } else if command.name == "_result" {
+                "result"
+            } else if command.name == "_error" {
+                "error"
+            } else if transaction_id == TransactionId::NOTIFICATION {
+                "notify"
+            } else {
+                "invoke"
+            };
+            format!(
+                "{{\"method\":{},\"tid\":{},\"kind\":\"{kind}\",\"args\":{},\"command_object\":{}}}",
+                profiler::json_str(&command.name),
+                transaction_id.get(),
+                profiler::amf_list_to_json(&command.arguments),
+                profiler::amf_to_json(&command.command_object)
+            )
+        });
         if transaction_id == TransactionId::CONNECT {
             if command.name == "_result" {
                 self.connected = true;
@@ -291,7 +338,28 @@ impl RtmpConnection {
             "Sending RTMP command"
         );
         match self.session.send_command(command, timestamp) {
-            Ok(bytes) => Some(RtmpConnectionAction::Send(socket, bytes)),
+            Ok(bytes) => {
+                profiler::instant("rtmp", "send", || {
+                    let kind = if command.transaction_id == TransactionId::CONNECT {
+                        "connect"
+                    } else if command.name == "_result" || command.name == "_error" {
+                        "reply"
+                    } else if command.transaction_id == TransactionId::NOTIFICATION {
+                        "notify"
+                    } else {
+                        "call"
+                    };
+                    format!(
+                        "{{\"method\":{},\"tid\":{},\"kind\":\"{kind}\",\"bytes\":{},\"args\":{},\"command_object\":{}}}",
+                        profiler::json_str(&command.name),
+                        command.transaction_id.get(),
+                        bytes.len(),
+                        profiler::amf_list_to_json(&command.arguments),
+                        profiler::amf_to_json(&command.command_object)
+                    )
+                });
+                Some(RtmpConnectionAction::Send(socket, bytes))
+            }
             Err(error) => {
                 tracing::warn!(error = %error, "RTMP command could not be encoded");
                 None

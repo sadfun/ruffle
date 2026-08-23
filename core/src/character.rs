@@ -110,6 +110,27 @@ impl CompressedBitmap {
         }
     }
     pub fn decode(&self) -> Result<RenderBitmap<'static>, RenderError> {
+        crate::profiler::inc(crate::profiler::Counter::BitmapsDecoded);
+        let _span = crate::profiler::span("asset", "bitmap_decode").args(|| {
+            let size = self.size();
+            let (kind, bytes) = match self {
+                CompressedBitmap::Jpeg { data, alpha, .. } => (
+                    if alpha.is_some() {
+                        "jpeg+alpha"
+                    } else {
+                        "jpeg"
+                    },
+                    data.len() + alpha.as_ref().map_or(0, |alpha| alpha.len()),
+                ),
+                CompressedBitmap::Lossless(lossless) => ("lossless", lossless.data.len()),
+            };
+            format!(
+                "{{\"kind\":\"{kind}\",\"w\":{},\"h\":{},\"bytes\":{bytes},\"movie\":{}}}",
+                size.width,
+                size.height,
+                crate::profiler::movie_json()
+            )
+        });
         match self {
             CompressedBitmap::Jpeg {
                 data,

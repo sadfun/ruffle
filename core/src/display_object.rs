@@ -953,6 +953,7 @@ pub fn render_base<'gc>(
         // Skip rendering masks (unless we are rendering one explicitly).
         return;
     }
+    crate::profiler::inc(crate::profiler::Counter::DisplayObjectsRendered);
 
     if options.apply_transform {
         let transform = this.base().transform(options.apply_matrix);

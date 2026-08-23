@@ -96,6 +96,9 @@ egui = ["dep:egui", "dep:egui_extras", "png"]
 jpegxr = ["dep:jpegxr", "ruffle_render/jpegxr", "lzma"]
 default_font = []
 serde = ["serde/derive"]
+# Shararam profiling build: records frame/render/load/RTMP events for the
+# external profiler viewer. Off by default; see core/src/profiler.rs.
+shararam_profiler = []
 
 [build-dependencies]
 build_playerglobal = { path = "build_playerglobal" }

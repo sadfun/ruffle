@@ -500,6 +500,11 @@ impl<'gc> MovieClip<'gc> {
             return true;
         }
 
+        let _movie_scope = crate::profiler::movie_scope(swf.movie.clone());
+        let mut preload_span = crate::profiler::span("swf", "preload_chunk").min_duration_ms(0.25);
+        let preload_start_offset = progress.next_preload_chunk.get();
+        let preload_start_frame = progress.cur_preload_frame.get();
+
         let reader = &mut swf.read_from(progress.next_preload_chunk.get());
 
         let mut sub_preload_done = true;
@@ -621,6 +626,21 @@ impl<'gc> MovieClip<'gc> {
                 (reader.get_ref().as_ptr() as u64).saturating_sub(swf.data().as_ptr() as u64);
             progress.next_preload_chunk.set(next_chunk);
         }
+
+        preload_span.set_args(|| {
+            let end_offset = if is_finished {
+                swf.len() as u64
+            } else {
+                progress.next_preload_chunk.get()
+            };
+            format!(
+                "{{\"id\":{},\"movie\":{},\"from\":{preload_start_offset},\"to\":{end_offset},\"bytes\":{},\"frame_from\":{preload_start_frame},\"frame_to\":{},\"done\":{is_finished}}}",
+                shared.id,
+                crate::profiler::json_str(swf.movie.url()),
+                end_offset.saturating_sub(preload_start_offset),
+                progress.cur_preload_frame.get()
+            )
+        });
 
         is_finished
     }
@@ -1636,6 +1656,15 @@ impl<'gc> MovieClip<'gc> {
     }
 
     fn run_goto(mut self, context: &mut UpdateContext<'gc>, frame: FrameNumber, is_implicit: bool) {
+        let _span = crate::profiler::span("script", "goto")
+            .min_duration_ms(0.25)
+            .args(|| {
+                format!(
+                    "{{\"clip\":{},\"from\":{},\"to\":{frame},\"implicit\":{is_implicit}}}",
+                    crate::profiler::json_str(&self.path().to_utf8_lossy()),
+                    self.current_frame()
+                )
+            });
         if cfg!(feature = "timeline_debug") {
             tracing::debug!(
                 "[{}]: {} from frame {} to frame {}",
@@ -3836,6 +3865,15 @@ impl<'gc, 'a> MovieClipShared<'gc> {
     ) -> Result<(), Error> {
         let font = reader.read_define_font_2(2)?;
         let font_id = font.id;
+        let _span = crate::profiler::span("swf", "define_font")
+            .min_duration_ms(0.25)
+            .args(|| {
+                format!(
+                    "{{\"id\":{font_id},\"glyphs\":{},\"movie\":{}}}",
+                    font.glyphs.len(),
+                    crate::profiler::movie_json()
+                )
+            });
         let font_object = Font::from_swf_tag(
             context.gc(),
             context.renderer,
@@ -3856,6 +3894,15 @@ impl<'gc, 'a> MovieClipShared<'gc> {
     ) -> Result<(), Error> {
         let font = reader.read_define_font_2(3)?;
         let font_id = font.id;
+        let _span = crate::profiler::span("swf", "define_font")
+            .min_duration_ms(0.25)
+            .args(|| {
+                format!(
+                    "{{\"id\":{font_id},\"glyphs\":{},\"movie\":{}}}",
+                    font.glyphs.len(),
+                    crate::profiler::movie_json()
+                )
+            });
         let font_object = Font::from_swf_tag(
             context.gc(),
             context.renderer,

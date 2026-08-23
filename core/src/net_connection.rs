@@ -257,6 +257,9 @@ impl<'gc> NetConnections<'gc> {
                     .to_be_bytes(),
             );
         }
+        crate::profiler::instant("rtmp", "connect", || {
+            format!("{{\"uri\":{}}}", crate::profiler::json_str(&uri))
+        });
         let Ok(rtmp) =
             RtmpConnection::new(uri, extra_arguments, properties, time, c1_random, c2_random)
         else {
@@ -534,6 +537,7 @@ impl<'gc> NetConnections<'gc> {
             RtmpConnectionAction::Send(socket, bytes) => context.sockets.send(socket, bytes),
             RtmpConnectionAction::CloseSocket(socket) => context.sockets.close(socket),
             RtmpConnectionAction::Connected(command) => {
+                let _span = crate::profiler::span("script", "rtmp_connected");
                 if let Some(NetConnectionObject::Avm1(object)) = context
                     .net_connections
                     .connections
@@ -585,9 +589,25 @@ impl<'gc> NetConnections<'gc> {
                 responder,
                 callback,
                 command,
-            } => responder.call_rtmp(context, callback, &command),
+            } => {
+                let _span = crate::profiler::span("script", "rtmp_responder").args(|| {
+                    format!(
+                        "{{\"method\":{},\"tid\":{}}}",
+                        crate::profiler::json_str(&command.name),
+                        command.transaction_id.get()
+                    )
+                });
+                responder.call_rtmp(context, callback, &command)
+            }
             RtmpConnectionAction::Invoke(command) => {
                 let transaction_id = command.transaction_id;
+                let _span = crate::profiler::span("script", "rtmp_invoke").args(|| {
+                    format!(
+                        "{{\"method\":{},\"tid\":{}}}",
+                        crate::profiler::json_str(&command.name),
+                        transaction_id.get()
+                    )
+                });
                 if let Some(NetConnectionObject::Avm1(object)) = context
                     .net_connections
                     .connections
