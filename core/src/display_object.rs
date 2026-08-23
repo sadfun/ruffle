@@ -1154,7 +1154,24 @@ pub fn render_base<'gc>(
             } else {
                 RenderBlendMode::Builtin(blend_mode.try_into().unwrap())
             };
-            context.commands.blend(sub_commands, render_blend_mode);
+            // Ruffle folds this object's color transform into its children
+            // and composites Layer buffers with an identity transform, so by
+            // associativity of "over" an isolated Layer group renders
+            // identically to its commands inlined — unless something in the
+            // subtree blends against its local backdrop. Skipping the
+            // isolation avoids a full-target offscreen render per group per
+            // frame (Shararam sets blendMode="layer" on every avatar, which
+            // made this the dominant per-frame GPU cost).
+            let skip_layer_isolation = matches!(
+                render_blend_mode,
+                RenderBlendMode::Builtin(swf::BlendMode::Layer)
+            ) && sub_commands.is_backdrop_independent();
+            if skip_layer_isolation {
+                crate::profiler::inc(crate::profiler::Counter::LayerBlendsInlined);
+                context.commands.append(sub_commands);
+            } else {
+                context.commands.blend(sub_commands, render_blend_mode);
+            }
         }
     }
 
