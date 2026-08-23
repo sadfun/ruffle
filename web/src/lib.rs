@@ -7,6 +7,8 @@ mod external_interface;
 mod input;
 mod log_adapter;
 mod navigator;
+#[cfg(feature = "shararam_profiler")]
+mod profiler;
 mod storage;
 mod ui;
 mod zip;
@@ -1120,6 +1122,8 @@ impl RuffleHandle {
     }
 
     fn tick(self, timestamp: f64) {
+        let _host_span = ruffle_core::profiler::span("frame", "host_tick")
+            .args(|| format!("{{\"raf\":{timestamp:.3}}}"));
         let mut dt = 0.0;
         let mut new_dimensions = None;
         let mut gamepad_button_events = Vec::new();
@@ -1358,6 +1362,9 @@ fn parse_movie_parameters(input: &JsValue) -> Vec<(String, String)> {
 
 #[wasm_bindgen(start)]
 fn global_init() {
+    #[cfg(feature = "shararam_profiler")]
+    profiler::install();
+
     // Redirect Log to Tracing
     let _ = tracing_log::LogTracer::builder()
         // wgpu crates are extremely verbose

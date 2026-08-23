@@ -874,6 +874,18 @@ impl<'gc> EditText<'gc> {
     /// have already been calculated and applied to HTML trees lowered into the
     /// text-span representation.
     pub fn relayout(self, context: &mut UpdateContext<'gc>) {
+        crate::profiler::inc(crate::profiler::Counter::TextLayouts);
+        let _span = crate::profiler::span("text", "relayout")
+            .min_duration_ms(0.25)
+            .args(|| {
+                format!(
+                    "{{\"chars\":{},\"name\":{}}}",
+                    self.0.text_spans.borrow().text().len(),
+                    crate::profiler::json_str(
+                        &self.name().map(|name| name.to_string()).unwrap_or_default()
+                    )
+                )
+            });
         let autosize = self.0.autosize.get();
         let is_word_wrap = self.0.flags.get().contains(EditTextFlag::WORD_WRAP);
         let movie = self.0.shared.swf.clone();

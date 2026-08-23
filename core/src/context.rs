@@ -355,6 +355,19 @@ impl<'gc> UpdateContext<'gc> {
             self.frame_rate,
         );
 
+        crate::profiler::instant("load", "root_movie", || {
+            format!(
+                "{{\"url\":{},\"version\":{},\"w\":{},\"h\":{},\"fps\":{},\"frames\":{},\"compressed\":{},\"uncompressed\":{}}}",
+                crate::profiler::json_str(movie.url()),
+                movie.version(),
+                movie.width(),
+                movie.height(),
+                movie.frame_rate(),
+                movie.num_frames(),
+                movie.compressed_len(),
+                movie.uncompressed_len()
+            )
+        });
         *self.root_swf = Arc::new(movie);
         *self.instance_counter = 0;
 

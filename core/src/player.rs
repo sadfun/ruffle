@@ -49,6 +49,7 @@ use crate::local_connection::LocalConnections;
 use crate::net_connection::NetConnections;
 use crate::orphan_manager::OrphanManager;
 use crate::prelude::*;
+use crate::profiler;
 use crate::socket::Sockets;
 use crate::streams::StreamManager;
 use crate::string::{AvmStringInterner, StringContext};
@@ -524,6 +525,9 @@ impl Player {
             return;
         }
 
+        let mut tick_span = profiler::span("frame", "tick");
+        let mut frames_run = 0u32;
+
         self.frame_accumulator += dt;
         let frame_duration = self.frame_duration();
 
@@ -532,7 +536,17 @@ impl Player {
 
         while frame < max_frames_per_tick && self.frame_accumulator >= frame_duration {
             let timer = Instant::now();
-            self.run_frame();
+            {
+                let _frame_span = profiler::span("frame", "run_frame").args(|| {
+                    format!(
+                        "{{\"frame\":{},\"behind_ms\":{:.1}}}",
+                        self.current_frame.unwrap_or(0),
+                        (self.frame_accumulator - frame_duration).as_millis()
+                    )
+                });
+                self.run_frame();
+            }
+            frames_run += 1;
             let elapsed = timer.elapsed().as_millis() as f64;
 
             self.add_frame_timing(elapsed);
@@ -578,13 +592,31 @@ impl Player {
         });
         self.frame_accumulator += FloatDuration::from_secs(audio_skew);
 
-        self.update_sockets();
-        self.update_net_connections();
-        self.update_timers(dt);
-        self.update(|context| {
-            StreamManager::tick(context, dt);
-        });
+        {
+            let _span = profiler::span("net", "update_sockets").min_duration_ms(0.05);
+            self.update_sockets();
+        }
+        {
+            let _span = profiler::span("net", "update_net_connections").min_duration_ms(0.05);
+            self.update_net_connections();
+        }
+        {
+            let _span = profiler::span("script", "timers").min_duration_ms(0.05);
+            self.update_timers(dt);
+        }
+        {
+            let _span = profiler::span("net", "streams").min_duration_ms(0.05);
+            self.update(|context| {
+                StreamManager::tick(context, dt);
+            });
+        }
         self.audio.tick();
+        tick_span.set_args(|| {
+            format!(
+                "{{\"dt\":{:.2},\"frames\":{frames_run},\"max_frames\":{max_frames_per_tick}}}",
+                dt.as_millis()
+            )
+        });
     }
 
     pub fn time_til_next_timer(&self) -> Option<f64> {
@@ -1012,6 +1044,22 @@ impl Player {
     /// Handle an event sent into the player from the external windowing system
     /// or an HTML element.
     pub fn handle_event(&mut self, event: PlayerEvent) -> bool {
+        let _span = profiler::span("input", "handle_event")
+            .min_duration_ms(0.2)
+            .args(|| {
+                let kind = match &event {
+                    PlayerEvent::KeyDown { .. } => "key_down",
+                    PlayerEvent::KeyUp { .. } => "key_up",
+                    PlayerEvent::MouseMove { .. } => "mouse_move",
+                    PlayerEvent::MouseUp { .. } => "mouse_up",
+                    PlayerEvent::MouseDown { .. } => "mouse_down",
+                    PlayerEvent::MouseLeave => "mouse_leave",
+                    PlayerEvent::MouseWheel { .. } => "mouse_wheel",
+                    PlayerEvent::FocusGained | PlayerEvent::FocusLost => "focus",
+                    _ => "other",
+                };
+                format!("{{\"kind\":\"{kind}\"}}")
+            });
         match event {
             PlayerEvent::FocusGained | PlayerEvent::FocusLost => self.handle_focus_event(event),
             PlayerEvent::KeyDown { .. }
@@ -1964,6 +2012,7 @@ impl Player {
     /// simulate a particular load condition or stress chunked loading may use
     /// this in lieu of an unlimited execution limit.
     pub fn preload(&mut self, limit: &mut ExecutionLimit) -> bool {
+        let _span = profiler::span("load", "preload").min_duration_ms(0.1);
         self.mutate_with_update_context(|context| {
             let mut did_finish = true;
 
@@ -2022,8 +2071,14 @@ impl Player {
 
         self.update(|context| {
             // TODO: Is this order correct?
-            run_all_phases_avm2(context);
-            Avm1::run_frame(context);
+            {
+                let _span = profiler::span("script", "avm2_frame").min_duration_ms(0.05);
+                run_all_phases_avm2(context);
+            }
+            {
+                let _span = profiler::span("script", "avm1_frame");
+                Avm1::run_frame(context);
+            }
             AudioManager::update_sounds(context);
             LocalConnections::update_connections(context);
 
@@ -2039,6 +2094,7 @@ impl Player {
 
     #[instrument(level = "debug", skip_all)]
     pub fn render(&mut self) {
+        let mut render_span = profiler::span("render", "render");
         let invalidated = self.enter_arena(|_, gc_root, _| gc_root.stage.invalidated());
 
         if invalidated {
@@ -2086,8 +2142,21 @@ impl Player {
             (cache_draws, commands)
         });
 
-        self.renderer
-            .submit_frame(background_color, commands, cache_draws);
+        render_span.set_args(|| {
+            let counters = profiler::take_counters();
+            format!(
+                "{{\"commands\":{},\"cache_draws\":{},{}}}",
+                commands.commands.len(),
+                cache_draws.len(),
+                profiler::counters_json(&counters)
+            )
+        });
+        {
+            let _submit_span = profiler::span("render", "submit");
+            self.renderer
+                .submit_frame(background_color, commands, cache_draws);
+        }
+        drop(render_span);
 
         self.needs_render = false;
     }
@@ -2374,7 +2443,10 @@ impl Player {
         let rval = self.mutate_with_update_context(|context| {
             let rval = func(context);
 
-            Self::run_actions(context);
+            {
+                let _span = profiler::span("script", "run_actions").min_duration_ms(0.05);
+                Self::run_actions(context);
+            }
 
             rval
         });
@@ -2386,7 +2458,10 @@ impl Player {
         self.update_mouse_state(EnumSet::empty(), false, &mut false);
 
         // GC
-        self.gc_arena.borrow_mut().collect_debt();
+        {
+            let _span = profiler::span("gc", "collect").min_duration_ms(0.05);
+            self.gc_arena.borrow_mut().collect_debt();
+        }
 
         rval
     }
@@ -3005,6 +3080,10 @@ impl PlayerBuilder {
         let player_version = self.player_version.unwrap_or(DEFAULT_PLAYER_VERSION);
         let language = ui.language();
 
+        #[cfg(feature = "shararam_profiler")]
+        let renderer: Box<dyn RenderBackend> =
+            Box::new(crate::profiler::ProfiledRenderer::new(renderer));
+
         // Instantiate the player.
         let fake_movie = Arc::new(SwfMovie::empty(player_version, None));
         let frame_rate = self.frame_rate.unwrap_or(12.0);
@@ -3201,6 +3280,7 @@ fn run_mouse_pick<'gc>(
     context: &mut UpdateContext<'gc>,
     require_button_mode: bool,
 ) -> Option<InteractiveObject<'gc>> {
+    let _span = profiler::span("input", "mouse_pick").min_duration_ms(0.2);
     context.stage.iter_render_list().rev().find_map(|level| {
         level.as_interactive().and_then(|l| {
             if l.as_displayobject().movie().is_action_script_3() {

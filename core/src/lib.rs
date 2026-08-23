@@ -40,6 +40,7 @@ mod orphan_manager;
 pub mod pixel_bender;
 mod player;
 mod prelude;
+pub mod profiler;
 mod rtmp;
 pub mod socket;
 mod streams;

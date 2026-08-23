@@ -33,6 +33,7 @@ use crate::display_object::{
 use crate::events::ClipEvent;
 use crate::limits::ExecutionLimit;
 use crate::player::{Player, PostFrameCallback};
+use crate::profiler;
 use crate::streams::{NetStream, NetStreamHandle};
 use crate::string::{AvmString, StringContext};
 use crate::tag_utils::SwfMovie;
@@ -59,6 +60,14 @@ new_key_type! {
 
 /// The depth of AVM1 movies that AVM2 loads.
 const LOADER_INSERTED_AVM1_DEPTH: i32 = -0xF000;
+
+/// A stable numeric identity for a loader, used to correlate the profiler's
+/// load events (`loader` argument).
+#[cfg_attr(not(feature = "shararam_profiler"), allow(dead_code))]
+fn profiler_loader_id(handle: LoaderHandle) -> u64 {
+    use slotmap::Key;
+    handle.data().as_ffi()
+}
 
 /// How Ruffle should load movies.
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
@@ -322,6 +331,14 @@ impl<'gc> LoadManager<'gc> {
             movie: None,
         };
         let handle = self.add_loader(loader);
+        profiler::instant("load", "movie_load_start", || {
+            format!(
+                "{{\"loader\":{},\"url\":{},\"target\":{}}}",
+                profiler_loader_id(handle),
+                profiler::json_str(request.url()),
+                profiler::json_str(&target_clip.path().to_utf8_lossy())
+            )
+        });
         let loader = self.get_loader_mut(handle).unwrap();
         loader.movie_loader(player, request, loader_url)
     }
@@ -499,15 +516,48 @@ impl Default for LoadManager<'_> {
 async fn wait_for_full_response(
     response: OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse>,
 ) -> Result<(Vec<u8>, String, u16, bool), ErrorResponse> {
-    let response = response.await?;
+    let started = profiler::now();
+    let response = match response.await {
+        Ok(response) => response,
+        Err(error) => {
+            profiler::complete("http", "fetch", started, || {
+                format!(
+                    "{{\"url\":{},\"ok\":false,\"error\":{}}}",
+                    profiler::json_str(&error.url),
+                    profiler::json_str_truncated(&error.error.to_string(), 300)
+                )
+            });
+            return Err(error);
+        }
+    };
     let url = response.url().to_string();
     let status = response.status();
     let redirected = response.redirected();
+    let headers_at = profiler::now();
     let body = response.body().await;
 
     match body {
-        Ok(body) => Ok((body, url, status, redirected)),
-        Err(error) => Err(ErrorResponse { url, error }),
+        Ok(body) => {
+            profiler::complete("http", "fetch", started, || {
+                format!(
+                    "{{\"url\":{},\"ok\":true,\"status\":{status},\"bytes\":{},\"headers_ms\":{:.1}}}",
+                    profiler::json_str(&url),
+                    body.len(),
+                    headers_at - started
+                )
+            });
+            Ok((body, url, status, redirected))
+        }
+        Err(error) => {
+            profiler::complete("http", "fetch", started, || {
+                format!(
+                    "{{\"url\":{},\"ok\":false,\"status\":{status},\"error\":{}}}",
+                    profiler::json_str(&url),
+                    profiler::json_str_truncated(&error.to_string(), 300)
+                )
+            });
+            Err(ErrorResponse { url, error })
+        }
     }
 }
 
@@ -652,7 +702,18 @@ impl<'gc> MovieLoader<'gc> {
 
         let mc = mc.as_movie_clip().unwrap();
 
+        let mut preload_span = profiler::span("load", "preload_tick").min_duration_ms(0.05);
         let did_finish = mc.preload(context, limit);
+        preload_span.set_args(|| {
+            format!(
+                "{{\"loader\":{},\"url\":{},\"loaded\":{},\"total\":{},\"done\":{did_finish}}}",
+                profiler_loader_id(handle),
+                profiler::json_str(mc.movie().url()),
+                mc.compressed_loaded_bytes(),
+                mc.compressed_total_bytes()
+            )
+        });
+        drop(preload_span);
 
         MovieLoader::movie_loader_progress(
             handle,
@@ -1061,6 +1122,7 @@ pub fn load_form_into_load_vars<'gc>(
     let target_object = ObjectHandle::stash(uc, target_object);
 
     Box::pin(async move {
+        let request_url = request.url().to_string();
         let fetch = player.lock().unwrap().fetch(request, FetchReason::Other);
         let response = wait_for_full_response(fetch).await;
 
@@ -1073,6 +1135,12 @@ pub fn load_form_into_load_vars<'gc>(
             match response {
                 Ok((body, _, status, _)) => {
                     let length = body.len();
+                    let _span = profiler::span("script", "load_vars_on_data").args(|| {
+                        format!(
+                            "{{\"url\":{},\"bytes\":{length},\"status\":{status}}}",
+                            profiler::json_str(&request_url)
+                        )
+                    });
 
                     // Set the properties used by the getBytesTotal and getBytesLoaded methods.
                     that.set(
@@ -1619,6 +1687,13 @@ impl<'gc> MovieLoader<'gc> {
     ) -> Result<(), Error> {
         let sniffed_type = ContentType::sniff(data);
         let length = data.len();
+        let _span = profiler::span("load", "movie_data").args(|| {
+            format!(
+                "{{\"loader\":{},\"url\":{},\"bytes\":{length},\"status\":{status},\"type\":\"{sniffed_type:?}\"}}",
+                profiler_loader_id(handle),
+                profiler::json_str(&url)
+            )
+        });
 
         if sniffed_type == ContentType::Unknown
             && let Ok(data) = extract_swz(data)
@@ -2027,6 +2102,13 @@ impl<'gc> MovieLoader<'gc> {
             }) => (*target_clip, *vm_data, movie.clone()),
             None => return Err(Error::Cancelled),
         };
+        let _span = profiler::span("load", "movie_complete").args(|| {
+            format!(
+                "{{\"loader\":{},\"url\":{},\"status\":{status}}}",
+                profiler_loader_id(handle),
+                profiler::json_str(movie.as_ref().map(|movie| movie.url()).unwrap_or("")),
+            )
+        });
 
         let loader_info = if let MovieLoaderVMData::Avm2 { loader_info, .. } = vm_data {
             Some(loader_info)
@@ -2187,6 +2269,14 @@ impl<'gc> MovieLoader<'gc> {
         redirected: bool,
         swf_url: String,
     ) -> Result<(), Error> {
+        profiler::instant("load", "movie_error", || {
+            format!(
+                "{{\"loader\":{},\"url\":{},\"status\":{status},\"message\":{}}}",
+                profiler_loader_id(handle),
+                profiler::json_str(&swf_url),
+                profiler::json_str(msg)
+            )
+        });
         //TODO: Inspect the fetch error.
         //This requires cooperation from the backend to send abstract
         //error types we can actually inspect.
@@ -2323,6 +2413,15 @@ impl<'gc> MovieLoader<'gc> {
             LoaderStatus::Parsing => false,
             LoaderStatus::Failed => true,
             LoaderStatus::Succeeded => {
+                profiler::instant("load", "movie_init_queued", || {
+                    format!(
+                        "{{\"loader\":{},\"url\":{}}}",
+                        self.self_handle.map(profiler_loader_id).unwrap_or(0),
+                        profiler::json_str(
+                            self.movie.as_ref().map(|movie| movie.url()).unwrap_or("")
+                        ),
+                    )
+                });
                 // AVM2 is handled separately
                 if let MovieLoaderVMData::Avm1 {
                     broadcaster: Some(broadcaster),
