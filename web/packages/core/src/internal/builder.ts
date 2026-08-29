@@ -38,6 +38,9 @@ export function configureBuilder(
     if (isExplicit(config.upgradeToHttps)) {
         builder.setUpgradeToHttps(config.upgradeToHttps);
     }
+    if (isExplicit(config.layerBlendInlining)) {
+        builder.setLayerBlendInlining(config.layerBlendInlining);
+    }
     if (isExplicit(config.compatibilityRules)) {
         builder.setCompatibilityRules(config.compatibilityRules);
     }

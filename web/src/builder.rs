@@ -41,6 +41,7 @@ pub struct RuffleInstanceBuilder {
     pub(crate) background_color: Option<Color>,
     pub(crate) letterbox: Letterbox,
     pub(crate) upgrade_to_https: bool,
+    pub(crate) layer_blend_inlining: bool,
     pub(crate) compatibility_rules: CompatibilityRules,
     pub(crate) base_url: Option<String>,
     pub(crate) spoofed_url: Option<String>,
@@ -84,6 +85,7 @@ impl Default for RuffleInstanceBuilder {
             background_color: None,
             letterbox: Letterbox::Fullscreen,
             upgrade_to_https: true,
+            layer_blend_inlining: true,
             compatibility_rules: CompatibilityRules::default(),
             base_url: None,
             spoofed_url: None,
@@ -138,6 +140,11 @@ impl RuffleInstanceBuilder {
     #[wasm_bindgen(js_name = "setUpgradeToHttps")]
     pub fn set_upgrade_to_https(&mut self, value: bool) {
         self.upgrade_to_https = value;
+    }
+
+    #[wasm_bindgen(js_name = "setLayerBlendInlining")]
+    pub fn set_layer_blend_inlining(&mut self, value: bool) {
+        self.layer_blend_inlining = value;
     }
 
     #[wasm_bindgen(js_name = "setCompatibilityRules")]
@@ -709,6 +716,7 @@ impl RuffleInstanceBuilder {
 
         let (renderer, canvas) = self.create_renderer().await?;
 
+        ruffle_core::set_inline_layer_blends(self.layer_blend_inlining);
         let mut builder = PlayerBuilder::new()
             .with_boxed_renderer(renderer)
             .with_boxed_audio(self.create_audio_backend(log_subscriber.clone()))

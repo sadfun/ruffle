@@ -22,6 +22,7 @@ export const DEFAULT_CONFIG: Required<BaseLoadOptions> = {
     letterbox: Letterbox.Fullscreen,
     unmuteOverlay: UnmuteOverlay.Visible,
     upgradeToHttps: true,
+    layerBlendInlining: true,
     compatibilityRules: true,
     favorFlash: true,
     warnOnUnsupportedContent: true,

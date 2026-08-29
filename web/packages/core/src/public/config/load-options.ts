@@ -485,6 +485,16 @@ export interface BaseLoadOptions {
     upgradeToHttps?: boolean;
 
     /**
+     * Whether `BlendMode.LAYER` groups whose contents do not blend against
+     * their backdrop are rendered inline instead of through a screen-sized
+     * offscreen surface. Output-identical and much faster; this switch is a
+     * safety valve only.
+     *
+     * @default true
+     */
+    layerBlendInlining?: boolean;
+
+    /**
      * Enable (true) or disable (false) Ruffle's built in compatibility rules.
      *
      * These are rules that may make some content work by deliberately changing
