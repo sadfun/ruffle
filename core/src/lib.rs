@@ -7,7 +7,7 @@
 
 #[macro_use]
 mod display_object;
-pub use display_object::{StageAlign, StageDisplayState, StageScaleMode};
+pub use display_object::{StageAlign, StageDisplayState, StageScaleMode, set_inline_layer_blends};
 
 #[macro_use]
 extern crate num_derive;

@@ -90,6 +90,31 @@ impl CommandList {
     pub fn drawing_mask(&self) -> bool {
         self.maskers_in_progress > 0
     }
+
+    /// Appends another (finished, mask-balanced) command list verbatim,
+    /// under the same nested-masker rule as the other push methods.
+    pub fn append(&mut self, other: CommandList) {
+        if self.maskers_in_progress <= 1 {
+            self.commands.extend(other.commands);
+        }
+    }
+
+    /// Whether every draw in this tree composites independently of its local
+    /// backdrop — i.e. the tree contains only Normal/Layer blends. Because
+    /// Porter-Duff "over" is associative, such a tree renders identically
+    /// whether or not it is isolated in an offscreen layer first. Alpha
+    /// masks isolate themselves internally, so they do not make the tree
+    /// backdrop-dependent.
+    pub fn is_backdrop_independent(&self) -> bool {
+        self.commands.iter().all(|command| match command {
+            Command::Blend(
+                inner,
+                RenderBlendMode::Builtin(BlendMode::Normal | BlendMode::Layer),
+            ) => inner.is_backdrop_independent(),
+            Command::Blend(..) => false,
+            _ => true,
+        })
+    }
 }
 
 impl CommandHandler for CommandList {
@@ -234,4 +259,46 @@ pub enum Command {
     DeactivateMask,
     PopMask,
     Blend(CommandList, RenderBlendMode),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backdrop_independence_follows_nested_blends() {
+        let empty = CommandList::new();
+        assert!(empty.is_backdrop_independent());
+
+        let mut layer = CommandList::new();
+        layer.commands.push(Command::Blend(
+            CommandList::new(),
+            RenderBlendMode::Builtin(BlendMode::Layer),
+        ));
+        assert!(layer.is_backdrop_independent());
+
+        let mut multiply_inside_layer = CommandList::new();
+        let mut inner = CommandList::new();
+        inner.commands.push(Command::Blend(
+            CommandList::new(),
+            RenderBlendMode::Builtin(BlendMode::Multiply),
+        ));
+        multiply_inside_layer.commands.push(Command::Blend(
+            inner,
+            RenderBlendMode::Builtin(BlendMode::Layer),
+        ));
+        assert!(!multiply_inside_layer.is_backdrop_independent());
+    }
+
+    #[test]
+    fn append_respects_nested_masker_suppression() {
+        let mut target = CommandList::new();
+        target.push_mask();
+        target.push_mask(); // nested masker: draws must be discarded
+        let mut other = CommandList::new();
+        other.commands.push(Command::PushMask);
+        let before = target.commands.len();
+        target.append(other);
+        assert_eq!(target.commands.len(), before);
+    }
 }

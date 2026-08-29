@@ -61,6 +61,21 @@ pub use loader_display::LoaderDisplay;
 pub use morph_shape::MorphShape;
 pub use movie_clip::{MovieClip, MovieClipHandle, MovieClipWeak, Scene};
 use ruffle_render::backend::{BitmapCacheEntry, RenderBackend};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Kill switch for rendering `BlendMode::Layer` groups inline instead of
+/// through a full-target offscreen surface (see `render_base`). The inline
+/// path is output-identical for backdrop-independent subtrees and massively
+/// cheaper; this switch exists purely as a safety valve for embedders.
+static INLINE_LAYER_BLENDS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_inline_layer_blends(enabled: bool) {
+    INLINE_LAYER_BLENDS.store(enabled, Ordering::Relaxed);
+}
+
+pub fn inline_layer_blends() -> bool {
+    INLINE_LAYER_BLENDS.load(Ordering::Relaxed)
+}
 use ruffle_render::bitmap::{BitmapHandle, BitmapInfo, PixelSnapping};
 use ruffle_render::blend::ExtendedBlendMode;
 use ruffle_render::commands::{CommandHandler, CommandList, RenderBlendMode};
@@ -1150,7 +1165,25 @@ pub fn render_base<'gc>(
             } else {
                 RenderBlendMode::Builtin(blend_mode.try_into().unwrap())
             };
-            context.commands.blend(sub_commands, render_blend_mode);
+            // Ruffle folds this object's color transform into its children
+            // and composites Layer buffers with an identity transform, so by
+            // associativity of "over" an isolated Layer group renders
+            // identically to its commands inlined — unless something in the
+            // subtree blends against its local backdrop. Skipping the
+            // isolation avoids a full-target offscreen render per group per
+            // frame (Shararam sets blendMode="layer" on every avatar, which
+            // made this the dominant per-frame GPU cost).
+            let inline_layer = inline_layer_blends()
+                && matches!(
+                    render_blend_mode,
+                    RenderBlendMode::Builtin(swf::BlendMode::Layer)
+                )
+                && sub_commands.is_backdrop_independent();
+            if inline_layer {
+                context.commands.append(sub_commands);
+            } else {
+                context.commands.blend(sub_commands, render_blend_mode);
+            }
         }
     }
 
