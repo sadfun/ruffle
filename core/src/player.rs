@@ -2150,7 +2150,7 @@ impl Player {
 
         let mut background_color = Color::WHITE;
 
-        let (cache_draws, commands) = self.enter_arena_mut(|gc_context, gc_root, this| {
+        let (cache_draws, commands, gc_objects) = self.enter_arena_mut(|gc_context, gc_root, this| {
             let stage = gc_root.stage;
 
             let mut cache_draws = vec![];
@@ -2187,13 +2187,14 @@ impl Player {
 
             gc_root.library.sweep_font_caches();
 
-            (cache_draws, commands)
+            let gc_objects = gc_context.metrics().total_gc_count();
+            (cache_draws, commands, gc_objects)
         });
 
         render_span.set_args(|| {
             let counters = profiler::take_counters();
             format!(
-                "{{\"commands\":{},\"cache_draws\":{},{}}}",
+                "{{\"commands\":{},\"cache_draws\":{},\"gc_objects\":{gc_objects},{}}}",
                 commands.commands.len(),
                 cache_draws.len(),
                 profiler::counters_json(&counters)

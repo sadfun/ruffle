@@ -153,6 +153,7 @@ impl<'gc> ArrayBuilder<'gc> {
     }
 
     fn init_with(self, this: Object<'gc>, elements: impl IntoIterator<Item = Value<'gc>>) {
+        crate::profiler::count_alloc(crate::profiler::Counter::Avm1ArraysCreated);
         let mut length: i32 = 0;
         for value in elements.into_iter() {
             let length_str = AvmString::new_utf8(self.mc, length.to_string());
