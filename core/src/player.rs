@@ -2150,46 +2150,47 @@ impl Player {
 
         let mut background_color = Color::WHITE;
 
-        let (cache_draws, commands, gc_objects) = self.enter_arena_mut(|gc_context, gc_root, this| {
-            let stage = gc_root.stage;
+        let (cache_draws, commands, gc_objects) =
+            self.enter_arena_mut(|gc_context, gc_root, this| {
+                let stage = gc_root.stage;
 
-            let mut cache_draws = vec![];
-            let mut render_context = RenderContext {
-                renderer: this.renderer.deref_mut(),
-                commands: CommandList::new(),
-                cache_draws: &mut cache_draws,
-                gc_context,
-                library: &mut gc_root.library,
-                ui: this.ui.deref(),
-                transform_stack: &mut this.transform_stack,
-                is_offscreen: false,
-                use_bitmap_cache: true,
-                stage,
-            };
-
-            stage.render_viewport(&mut render_context);
-
-            #[cfg(feature = "egui")]
-            {
-                this.debug_ui
-                    .borrow_mut()
-                    .draw_debug_rects(&mut render_context, gc_root.dynamic_root);
-            }
-
-            background_color =
-                if stage.window_mode() != WindowMode::Transparent || stage.is_fullscreen() {
-                    stage.background_color().unwrap_or(Color::WHITE)
-                } else {
-                    Color::from_rgba(0)
+                let mut cache_draws = vec![];
+                let mut render_context = RenderContext {
+                    renderer: this.renderer.deref_mut(),
+                    commands: CommandList::new(),
+                    cache_draws: &mut cache_draws,
+                    gc_context,
+                    library: &mut gc_root.library,
+                    ui: this.ui.deref(),
+                    transform_stack: &mut this.transform_stack,
+                    is_offscreen: false,
+                    use_bitmap_cache: true,
+                    stage,
                 };
 
-            let commands = render_context.commands;
+                stage.render_viewport(&mut render_context);
 
-            gc_root.library.sweep_font_caches();
+                #[cfg(feature = "egui")]
+                {
+                    this.debug_ui
+                        .borrow_mut()
+                        .draw_debug_rects(&mut render_context, gc_root.dynamic_root);
+                }
 
-            let gc_objects = gc_context.metrics().total_gc_count();
-            (cache_draws, commands, gc_objects)
-        });
+                background_color =
+                    if stage.window_mode() != WindowMode::Transparent || stage.is_fullscreen() {
+                        stage.background_color().unwrap_or(Color::WHITE)
+                    } else {
+                        Color::from_rgba(0)
+                    };
+
+                let commands = render_context.commands;
+
+                gc_root.library.sweep_font_caches();
+
+                let gc_objects = gc_context.metrics().total_gc_count();
+                (cache_draws, commands, gc_objects)
+            });
 
         render_span.set_args(|| {
             let counters = profiler::take_counters();

@@ -95,7 +95,12 @@ fn bitmap_key(handle: &BitmapHandle) -> usize {
 fn transformed_aabb(matrix: &Matrix, rect: [f32; 4]) -> [f32; 4] {
     let tx = matrix.tx.to_pixels() as f32;
     let ty = matrix.ty.to_pixels() as f32;
-    let mut out = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+    let mut out = [
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    ];
     for (x, y) in [
         (rect[0], rect[1]),
         (rect[2], rect[1]),
@@ -284,15 +289,14 @@ impl CommandWalk<'_> {
                 } => {
                     self.stats.bitmaps += 1;
                     if let Some(&(width, height)) = self.bitmap_sizes.get(&bitmap_key(bitmap)) {
-                        let rect =
-                            transformed_aabb(&transform.matrix, [0.0, 0.0, width, height]);
+                        let rect = transformed_aabb(&transform.matrix, [0.0, 0.0, width, height]);
                         self.grid.add_rect(rect, heavy);
                         union_into(&mut union, rect);
                     }
                 }
-                Command::DrawRect { .. } | Command::DrawLine { .. } | Command::DrawLineRect { .. } => {
-                    self.stats.rects += 1
-                }
+                Command::DrawRect { .. }
+                | Command::DrawLine { .. }
+                | Command::DrawLineRect { .. } => self.stats.rects += 1,
                 Command::PushMask => self.stats.stencil_masks += 1,
                 Command::ActivateMask | Command::DeactivateMask | Command::PopMask => {}
                 Command::RenderAlphaMask {
