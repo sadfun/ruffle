@@ -49,10 +49,18 @@ pub enum Counter {
     /// Layer blend groups rendered inline instead of through an offscreen
     /// target (see `render_base`).
     LayerBlendsInlined,
+    /// AVM1 script objects created (includes arrays and function wrappers,
+    /// which are script objects with a native payload).
+    Avm1ObjectsCreated,
+    /// AVM1 arrays built (also counted in `Avm1ObjectsCreated`).
+    Avm1ArraysCreated,
+    /// AVM1 function objects built: closures from `DefineFunction`, bound
+    /// methods, native wrappers (also counted in `Avm1ObjectsCreated`).
+    Avm1FunctionsCreated,
 }
 
 impl Counter {
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 12;
 
     pub const NAMES: [&'static str; Self::COUNT] = [
         "display_objects",
@@ -64,6 +72,9 @@ impl Counter {
         "objects_instantiated",
         "bitmaps_decoded",
         "layer_blends_inlined",
+        "avm1_objects",
+        "avm1_arrays",
+        "avm1_functions",
     ];
 }
 
@@ -263,6 +274,89 @@ mod imp {
             Some(movie) => json_str(movie.url()),
             None => "null".to_string(),
         })
+    }
+
+    // ---- AVM1 stack sampler ------------------------------------------------
+    //
+    // The interpreter ticks once per executed action; once per
+    // `SAMPLE_INTERVAL_MS` the current activation stack is rendered to a
+    // string and recorded as a span covering the time since the previous
+    // sample. Entering AVM1 from outside (a fresh root activation) resets the
+    // window so idle time between scripts is never attributed to a stack, and
+    // a root activation flushes its tail on drop so scripts shorter than the
+    // sampling interval still show up. The sum of sample durations therefore
+    // approximates total AVM1 execution time (native leaf calls are folded
+    // into their bytecode caller).
+
+    const SAMPLE_INTERVAL_MS: f64 = 1.0;
+    const SAMPLE_MIN_TAIL_MS: f64 = 0.05;
+    const TICKS_PER_CLOCK_CHECK: u32 = 32;
+
+    thread_local! {
+        static AVM1_LAST_SAMPLE: Cell<f64> = const { Cell::new(0.0) };
+        static AVM1_TICKS: Cell<u32> = const { Cell::new(0) };
+        static ALLOCS_SINCE_SAMPLE: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// Called when the interpreter enters AVM1 from the outside (a fresh
+    /// root activation): time before this instant belongs to no AVM1 stack.
+    #[inline]
+    pub fn avm1_enter() {
+        AVM1_LAST_SAMPLE.with(|last| last.set(now()));
+    }
+
+    /// Called once per executed AVM1 action. The closure renders the current
+    /// call stack (`"root / outer / inner"`) and is only evaluated when a
+    /// sample is due.
+    #[inline]
+    pub fn avm1_tick(stack: impl FnOnce() -> String) {
+        let due = AVM1_TICKS.with(|ticks| {
+            let count = ticks.get().wrapping_add(1);
+            ticks.set(count);
+            count % TICKS_PER_CLOCK_CHECK == 0
+        });
+        if due {
+            avm1_sample(SAMPLE_INTERVAL_MS, stack);
+        }
+    }
+
+    /// Called when a root activation ends: flushes the tail since the last
+    /// sample so short scripts are not lost entirely.
+    #[inline]
+    pub fn avm1_exit(stack: impl FnOnce() -> String) {
+        avm1_sample(SAMPLE_MIN_TAIL_MS, stack);
+    }
+
+    fn avm1_sample(threshold_ms: f64, stack: impl FnOnce() -> String) {
+        let now = now();
+        let last = AVM1_LAST_SAMPLE.with(|cell| cell.get());
+        let elapsed = now - last;
+        if elapsed < threshold_ms {
+            return;
+        }
+        AVM1_LAST_SAMPLE.with(|cell| cell.set(now));
+        let allocs = ALLOCS_SINCE_SAMPLE.with(|cell| cell.replace(0));
+        let mut args = String::with_capacity(96);
+        let _ = write!(args, "{{\"stack\":{}", json_str(&stack()));
+        if allocs > 0 {
+            let _ = write!(args, ",\"alloc\":{allocs}");
+        }
+        args.push('}');
+        push(Event {
+            ts: last,
+            dur: elapsed,
+            cat: "sampler",
+            name: "avm1",
+            args: Some(args),
+        });
+    }
+
+    /// Counter increment that also feeds the per-sample allocation count, so
+    /// samples can say how many objects the sampled stack created.
+    #[inline]
+    pub fn count_alloc(counter: Counter) {
+        inc(counter);
+        ALLOCS_SINCE_SAMPLE.with(|cell| cell.set(cell.get().wrapping_add(1)));
     }
 
     #[inline]
@@ -642,6 +736,27 @@ mod imp {
         }
 
         #[test]
+        fn avm1_sampler_records_weighted_stacks() {
+            let _ = drain_json();
+            avm1_enter();
+            count_alloc(Counter::Avm1ObjectsCreated);
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            for _ in 0..TICKS_PER_CLOCK_CHECK {
+                avm1_tick(|| "root / update".to_string());
+            }
+            avm1_exit(|| "root".to_string());
+            let json = drain_json();
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let events = parsed.as_array().unwrap();
+            assert!(!events.is_empty());
+            assert_eq!(events[0]["c"], "sampler");
+            assert_eq!(events[0]["n"], "avm1");
+            assert_eq!(events[0]["a"]["stack"], "root / update");
+            assert_eq!(events[0]["a"]["alloc"], 1);
+            assert!(events[0]["d"].as_f64().unwrap() >= 3.0);
+        }
+
+        #[test]
         fn counters_reset_when_taken() {
             take_counters();
             inc(Counter::ShapesRegistered);
@@ -765,6 +880,14 @@ mod imp {
     pub fn movie_json() -> String {
         String::new()
     }
+    #[inline(always)]
+    pub fn avm1_enter() {}
+    #[inline(always)]
+    pub fn avm1_tick(_stack: impl FnOnce() -> String) {}
+    #[inline(always)]
+    pub fn avm1_exit(_stack: impl FnOnce() -> String) {}
+    #[inline(always)]
+    pub fn count_alloc(_counter: Counter) {}
     #[inline(always)]
     pub fn inc(_counter: Counter) {}
     #[inline(always)]

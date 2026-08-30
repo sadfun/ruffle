@@ -344,6 +344,14 @@ impl<'gc> Avm1Function<'gc> {
 
         let name = if cfg!(feature = "avm_debug") {
             Cow::Owned(self.debug_string_for_call(activation, name, args))
+        } else if cfg!(feature = "shararam_profiler") {
+            // The stack sampler needs real function names, but rendering the
+            // arguments (as `debug_string_for_call` does) would be far too
+            // expensive on every call.
+            match self.name.map(ExecutionName::Dynamic).unwrap_or(name) {
+                ExecutionName::Static(name) => Cow::Borrowed(name),
+                ExecutionName::Dynamic(name) => Cow::Owned(name.to_utf8_lossy().into_owned()),
+            }
         } else {
             Cow::Borrowed("[Anonymous]")
         };
@@ -481,6 +489,7 @@ impl<'gc> FunctionObject<'gc> {
         fn_proto: Object<'gc>,
         prototype: Option<Object<'gc>>,
     ) -> Object<'gc> {
+        crate::profiler::count_alloc(crate::profiler::Counter::Avm1FunctionsCreated);
         let obj = Object::new(context, Some(fn_proto));
         let native = NativeObject::Function(Gc::new(context.gc(), self));
         obj.set_native(context.gc(), native);

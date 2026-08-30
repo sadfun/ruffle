@@ -2106,7 +2106,7 @@ impl Player {
 
         let mut background_color = Color::WHITE;
 
-        let (cache_draws, commands) = self.enter_arena_mut(|gc_context, gc_root, this| {
+        let (cache_draws, commands, gc_bytes) = self.enter_arena_mut(|gc_context, gc_root, this| {
             let stage = gc_root.stage;
 
             let mut cache_draws = vec![];
@@ -2139,13 +2139,14 @@ impl Player {
                 };
 
             let commands = render_context.commands;
-            (cache_draws, commands)
+            let gc_bytes = gc_context.metrics().total_gc_allocation();
+            (cache_draws, commands, gc_bytes)
         });
 
         render_span.set_args(|| {
             let counters = profiler::take_counters();
             format!(
-                "{{\"commands\":{},\"cache_draws\":{},{}}}",
+                "{{\"commands\":{},\"cache_draws\":{},\"gc_bytes\":{gc_bytes},{}}}",
                 commands.commands.len(),
                 cache_draws.len(),
                 profiler::counters_json(&counters)

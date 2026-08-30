@@ -82,6 +82,9 @@ impl fmt::Display for ActivationIdentifier<'_> {
 
 impl<'a> ActivationIdentifier<'a> {
     pub fn root(name: &'a str) -> Self {
+        // A fresh root means AVM1 is being entered from the outside; the
+        // stack sampler must not attribute the preceding gap to any stack.
+        crate::profiler::avm1_enter();
         Self {
             parent: None,
             reason: ExecutionReason::Special,
@@ -222,6 +225,9 @@ pub struct Activation<'a, 'gc: 'a> {
 impl Drop for Activation<'_, '_> {
     fn drop(&mut self) {
         avm_debug!(self.context.avm1, "END {}", self.id);
+        if self.id.parent.is_none() {
+            crate::profiler::avm1_exit(|| self.id.name.to_string());
+        }
     }
 }
 
@@ -448,6 +454,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
         let mut read = Reader::new(&code.movie.data()[code.start..], self.swf_version());
 
         loop {
+            crate::profiler::avm1_tick(|| self.id.to_string());
             let result = self.do_action(&code, &mut read);
             match result {
                 Ok(FrameControl::Return(return_type)) => break Ok(return_type),

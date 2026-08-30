@@ -130,6 +130,7 @@ impl<'gc> Object<'gc> {
         proto: Option<Value<'gc>>,
         native: NativeObject<'gc>,
     ) -> Self {
+        crate::profiler::count_alloc(crate::profiler::Counter::Avm1ObjectsCreated);
         let object = Self(Gc::new(
             context.gc(),
             RefLock::new(ObjectData {
@@ -152,6 +153,7 @@ impl<'gc> Object<'gc> {
 
     // Creates a Object, without assigning any __proto__ property.
     pub fn new_without_proto(gc_context: &Mutation<'gc>) -> Self {
+        crate::profiler::count_alloc(crate::profiler::Counter::Avm1ObjectsCreated);
         Self(Gc::new(
             gc_context,
             RefLock::new(ObjectData {
