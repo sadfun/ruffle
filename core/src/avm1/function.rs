@@ -85,6 +85,13 @@ pub struct Avm1Function<'gc> {
     /// The flags that define the preloaded registers of the function.
     #[collect(require_static)]
     flags: FunctionFlags,
+
+    /// Profiler label for anonymous functions: the bytecode position inside
+    /// its SWF, so the stack sampler can tell one closure from another and
+    /// the function can be found in a decompiler (see `exec`).
+    #[cfg(feature = "shararam_profiler")]
+    #[collect(require_static)]
+    anon_label: Option<std::sync::Arc<str>>,
 }
 
 impl<'gc> Avm1Function<'gc> {
@@ -117,6 +124,11 @@ impl<'gc> Avm1Function<'gc> {
             })
             .collect();
 
+        #[cfg(feature = "shararam_profiler")]
+        let anon_label = name
+            .is_none()
+            .then(|| profiler_anon_label(&actions).into());
+
         Avm1Function {
             swf_version,
             data: actions,
@@ -127,7 +139,19 @@ impl<'gc> Avm1Function<'gc> {
             constant_pool,
             base_clip,
             flags: swf_function.flags,
+            #[cfg(feature = "shararam_profiler")]
+            anon_label,
         }
+    }
+
+    #[cfg(feature = "shararam_profiler")]
+    fn anon_label_str(&self) -> Option<&str> {
+        self.anon_label.as_deref()
+    }
+
+    #[cfg(not(feature = "shararam_profiler"))]
+    fn anon_label_str(&self) -> Option<&str> {
+        None
     }
 
     pub fn swf_version(&self) -> u8 {
@@ -349,7 +373,14 @@ impl<'gc> Avm1Function<'gc> {
             // arguments (as `debug_string_for_call` does) would be far too
             // expensive on every call.
             match self.name.map(ExecutionName::Dynamic).unwrap_or(name) {
-                ExecutionName::Static(name) => Cow::Borrowed(name),
+                // A static name here is an engine placeholder ("[Anonymous]",
+                // "[Compare]", "[Timer Callback]" …): substitute the closure's
+                // bytecode position so different anonymous functions stay
+                // distinguishable and can be found in a decompiler.
+                ExecutionName::Static(name) => match self.anon_label_str() {
+                    Some(label) => Cow::Borrowed(label),
+                    None => Cow::Borrowed(name),
+                },
                 ExecutionName::Dynamic(name) => Cow::Owned(name.to_utf8_lossy().into_owned()),
             }
         } else {
@@ -425,6 +456,16 @@ struct Param<'gc> {
 
     /// The name of the parameter.
     name: AvmString<'gc>,
+}
+
+/// Position label for an anonymous function: SWF basename + byte offset of
+/// its body, e.g. `anon @base.swf+0x4f2a1`. Built once per DefineFunction.
+#[cfg(feature = "shararam_profiler")]
+fn profiler_anon_label(actions: &SwfSlice) -> String {
+    let url = actions.movie.url();
+    let base = url.rsplit('/').next().unwrap_or(url);
+    let base = base.split(['?', '#']).next().unwrap_or(base);
+    format!("anon @{base}+0x{:x}", actions.start)
 }
 
 /// Represents a function that can be defined in the Ruffle runtime or by the

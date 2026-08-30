@@ -37,7 +37,13 @@ covering the time since the previous sample. Entering AVM1 from outside
 its tail on drop, so the sum of sample durations approximates total AVM1
 execution time; native calls are folded into their bytecode caller. Real
 function names come from the same lookup `avm_debug` uses, but without the
-argument formatting (see `Avm1Function::exec`).
+argument formatting (see `Avm1Function::exec`); anonymous functions are
+labelled with their bytecode position (`anon @movie.swf+0xOFFSET`, cached
+once per DefineFunction) instead of the engine placeholders
+`[Anonymous]`/`[Compare]`/`[Timer Callback]`, so distinct closures stay
+distinguishable and can be located in a decompiler. `Array.sort`/`sortOn`
+run natively (invisible to the sampler), so `sort_internal` records a
+`script/array_sort` span with the array length.
 
 ## Allocation counters and screen grid
 

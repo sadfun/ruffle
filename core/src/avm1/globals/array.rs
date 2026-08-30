@@ -692,6 +692,12 @@ fn sort_internal<'gc>(
     is_sort_on: bool,
 ) -> Result<Value<'gc>, Error<'gc>> {
     let length = this.length(activation)?;
+    // The sort itself is native, so the stack sampler cannot see it; this
+    // span names the cost and the array size explicitly. Comparator bytecode
+    // runs inside and is sampled as usual.
+    let _span = crate::profiler::span("script", "array_sort")
+        .min_duration_ms(0.05)
+        .args(|| format!("{{\"n\":{length},\"sort_on\":{is_sort_on}}}"));
     let mut elements: Vec<_> = (0..length)
         .map(|i| (i, this.get_element(activation, i)))
         .collect();
