@@ -5,6 +5,7 @@ use crate::descriptors::Descriptors;
 use crate::globals::Globals;
 use crate::utils::create_buffer_with_data;
 use crate::utils::run_copy_pipeline;
+use ruffle_render::bitmap::PixelRegion;
 use std::cell::OnceCell;
 use std::sync::Arc;
 
@@ -58,7 +59,6 @@ impl ResolveBuffer {
 #[derive(Debug)]
 pub struct FrameBuffer {
     texture: PoolOrArcTexture,
-    size: wgpu::Extent3d,
 }
 
 #[derive(Debug)]
@@ -99,17 +99,15 @@ impl FrameBuffer {
 
         Self {
             texture: PoolOrArcTexture::Pool(texture),
-            size,
         }
     }
 
-    pub fn new_manual(texture: wgpu::Texture, size: wgpu::Extent3d) -> Self {
+    pub fn new_manual(texture: wgpu::Texture) -> Self {
         Self {
             texture: PoolOrArcTexture::Manual((
                 texture.clone(),
                 texture.create_view(&Default::default()),
             )),
-            size,
         }
     }
 
@@ -129,10 +127,6 @@ impl FrameBuffer {
 
     pub fn take_texture(self) -> PoolOrArcTexture {
         self.texture
-    }
-
-    pub fn size(&self) -> wgpu::Extent3d {
-        self.size
     }
 }
 
@@ -193,8 +187,10 @@ impl StencilBuffer {
 
 pub struct CommandTarget {
     frame_buffer: FrameBuffer,
-    blend_buffer: OnceCell<BlendBuffer>,
     resolve_buffer: Option<ResolveBuffer>,
+    /// Global pixel position of this target's top-left; a blend group's target
+    /// covers only the group's bounds, so its draws are shifted by this.
+    origin: (u32, u32),
     depth: OnceCell<StencilBuffer>,
     globals: Arc<Globals>,
     size: wgpu::Extent3d,
@@ -245,10 +241,7 @@ impl CommandTarget {
                         Some(ResolveBuffer::new_manual(texture.clone())),
                     )
                 } else {
-                    (
-                        FrameBuffer::new_manual(texture.clone(), texture.size()),
-                        None,
-                    )
+                    (FrameBuffer::new_manual(texture.clone()), None)
                 }
             } else if sample_count > 1 {
                 (
@@ -303,8 +296,8 @@ impl CommandTarget {
 
         Self {
             frame_buffer,
-            blend_buffer: OnceCell::new(),
             resolve_buffer,
+            origin: (0, 0),
             depth: OnceCell::new(),
             globals,
             size,
@@ -313,6 +306,34 @@ impl CommandTarget {
             whole_frame_bind_group,
             color_needs_clear: OnceCell::new(),
             render_target_mode,
+        }
+    }
+
+    pub fn with_origin(mut self, origin: (u32, u32)) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    pub fn origin(&self) -> (u32, u32) {
+        self.origin
+    }
+
+    /// `region` (global pixels) in this target's own pixels, clipped to it.
+    pub fn local_region(&self, region: PixelRegion) -> PixelRegion {
+        let (ox, oy) = self.origin;
+        let x_min = region.x_min.saturating_sub(ox).min(self.size.width);
+        let y_min = region.y_min.saturating_sub(oy).min(self.size.height);
+        PixelRegion {
+            x_min,
+            y_min,
+            x_max: region
+                .x_max
+                .saturating_sub(ox)
+                .clamp(x_min, self.size.width),
+            y_max: region
+                .y_max
+                .saturating_sub(oy)
+                .clamp(y_min, self.size.height),
         }
     }
 
@@ -398,23 +419,31 @@ impl CommandTarget {
         })
     }
 
+    /// Snapshots `region` (global pixels) of the colour drawn so far, so a
+    /// blend shader can read its backdrop. The snapshot is region-sized with
+    /// the region's top-left at (0, 0).
     pub fn update_blend_buffer(
         &self,
         descriptors: &Descriptors,
         pool: &mut TexturePool,
         encoder: &mut wgpu::CommandEncoder,
-    ) -> &BlendBuffer {
-        let blend_buffer = self.blend_buffer.get_or_init(|| {
-            BlendBuffer::new(
-                descriptors,
-                self.size,
-                self.format,
-                wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_DST
-                    | wgpu::TextureUsages::COPY_SRC,
-                pool,
-            )
-        });
+        region: PixelRegion,
+    ) -> BlendBuffer {
+        let local = self.local_region(region);
+        let size = wgpu::Extent3d {
+            width: local.width().max(1),
+            height: local.height().max(1),
+            depth_or_array_layers: 1,
+        };
+        let blend_buffer = BlendBuffer::new(
+            descriptors,
+            size,
+            self.format,
+            wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            pool,
+        );
         self.ensure_cleared(encoder);
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
@@ -424,7 +453,11 @@ impl CommandTarget {
                     .map(|b| b.texture())
                     .unwrap_or_else(|| self.frame_buffer.texture()),
                 mip_level: 0,
-                origin: Default::default(),
+                origin: wgpu::Origin3d {
+                    x: local.x_min,
+                    y: local.y_min,
+                    z: 0,
+                },
                 aspect: Default::default(),
             },
             wgpu::TexelCopyTextureInfo {
@@ -433,7 +466,7 @@ impl CommandTarget {
                 origin: Default::default(),
                 aspect: Default::default(),
             },
-            self.frame_buffer.size(),
+            size,
         );
         blend_buffer
     }

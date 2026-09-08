@@ -1616,6 +1616,7 @@ pub fn draw<'gc>(
         commands.blend(
             render_context.commands,
             RenderBlendMode::Builtin(blend_mode),
+            None,
         );
         commands
     };
