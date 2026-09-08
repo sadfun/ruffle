@@ -229,6 +229,11 @@ struct CommandStats {
     blend_layer: u32,
     blend_alpha_erase: u32,
     blend_complex: u32,
+    /// Multiply groups the wgpu backend composites with a blend state instead
+    /// of the shader: top-level in a frame cleared opaque, before any
+    /// Alpha/Erase/shader blend or Stage3D draw (mirrors
+    /// `WgpuCommandHandler::opaque`).
+    blend_multiply_direct: u32,
     blend_shader: u32,
     max_depth: u32,
 }
@@ -236,7 +241,7 @@ struct CommandStats {
 impl CommandStats {
     fn json_fields(&self) -> String {
         format!(
-            "\"shapes\":{},\"bitmaps\":{},\"rects\":{},\"stencil_masks\":{},\"alpha_masks\":{},\"blend_layer\":{},\"blend_alpha_erase\":{},\"blend_complex\":{},\"blend_shader\":{},\"max_depth\":{}",
+            "\"shapes\":{},\"bitmaps\":{},\"rects\":{},\"stencil_masks\":{},\"alpha_masks\":{},\"blend_layer\":{},\"blend_alpha_erase\":{},\"blend_complex\":{},\"blend_multiply_direct\":{},\"blend_shader\":{},\"max_depth\":{}",
             self.shapes,
             self.bitmaps,
             self.rects,
@@ -245,6 +250,7 @@ impl CommandStats {
             self.blend_layer,
             self.blend_alpha_erase,
             self.blend_complex,
+            self.blend_multiply_direct,
             self.blend_shader,
             self.max_depth
         )
@@ -253,6 +259,8 @@ impl CommandStats {
 
 struct CommandWalk<'a> {
     stats: CommandStats,
+    /// The frame target still has alpha 1 everywhere (see `blend_multiply_direct`).
+    root_opaque: bool,
     grid: ScreenGrid,
     shape_bounds: &'a HashMap<usize, [f32; 4]>,
     bitmap_sizes: &'a HashMap<usize, (f32, f32)>,
@@ -267,6 +275,9 @@ impl CommandWalk<'_> {
         }
         let mut union: Option<[f32; 4]> = None;
         for command in &list.commands {
+            if depth == 0 && matches!(command, Command::RenderStage3D { .. }) {
+                self.root_opaque = false;
+            }
             match command {
                 Command::RenderShape { shape, transform } => {
                     self.stats.shapes += 1;
@@ -330,6 +341,20 @@ impl CommandWalk<'_> {
                             "blend_shader"
                         }
                     };
+                    if depth == 0 {
+                        match mode {
+                            RenderBlendMode::Builtin(swf::BlendMode::Multiply)
+                                if self.root_opaque =>
+                            {
+                                self.stats.blend_multiply_direct += 1
+                            }
+                            RenderBlendMode::Builtin(
+                                swf::BlendMode::Alpha | swf::BlendMode::Erase,
+                            )
+                            | RenderBlendMode::Shader(_) => self.root_opaque = false,
+                            _ => {}
+                        }
+                    }
                     if let Some(rect) = self.walk(inner, depth + 1, true) {
                         if self.grid.hot.len() < MAX_HOT_RECTS {
                             self.grid.hot.push((rect, kind));
@@ -492,6 +517,7 @@ impl RenderBackend for ProfiledRenderer {
         let dimensions = self.inner.viewport_dimensions();
         let mut walk = CommandWalk {
             stats: CommandStats::default(),
+            root_opaque: clear.a == 255,
             grid: ScreenGrid::new(dimensions.width as f32, dimensions.height as f32),
             shape_bounds: &self.shape_bounds,
             bitmap_sizes: &self.bitmap_sizes,
