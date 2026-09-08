@@ -524,8 +524,36 @@ impl<'gc> MovieClip<'gc> {
             }
         }
 
+        // A library another instance of this movie has already filled: only
+        // per-instance tags (frames, labels, init actions, imports) matter now.
+        let defs_cached = context
+            .library
+            .library_for_movie(swf.movie.clone())
+            .is_some_and(|l| l.preloaded());
+
         let tag_callback = |reader: &mut SwfStream<'_>, tag_code| {
             let tag_len = reader.get_ref().len();
+            if defs_cached
+                && !matches!(
+                    tag_code,
+                    TagCode::DoInitAction
+                        | TagCode::DefineSceneAndFrameLabelData
+                        | TagCode::ExportAssets
+                        | TagCode::FrameLabel
+                        | TagCode::ShowFrame
+                        | TagCode::ScriptLimits
+                        | TagCode::SoundStreamHead
+                        | TagCode::SoundStreamHead2
+                        | TagCode::ImportAssets
+                        | TagCode::ImportAssets2
+                        | TagCode::DoAbc
+                        | TagCode::DoAbc2
+                        | TagCode::SymbolClass
+                        | TagCode::End
+                )
+            {
+                return Ok(ControlFlow::Continue);
+            }
             match tag_code {
                 TagCode::CsmTextSettings => shared.csm_text_settings(context, reader),
                 TagCode::DefineBits => shared.define_bits(context, reader),
@@ -616,6 +644,12 @@ impl<'gc> MovieClip<'gc> {
             }
             // Flag the movie as fully preloaded when we hit the end of the tag stream.
             progress.next_preload_chunk.set(u64::MAX);
+            if shared.id == 0 {
+                context
+                    .library
+                    .library_for_movie_mut(swf.movie.clone())
+                    .set_preloaded();
+            }
         } else {
             let next_chunk =
                 (reader.get_ref().as_ptr() as u64).saturating_sub(swf.data().as_ptr() as u64);

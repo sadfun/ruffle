@@ -1700,16 +1700,39 @@ impl<'gc> MovieLoader<'gc> {
 
         let movie = match sniffed_type {
             ContentType::Swf => {
-                let mut movie =
-                    SwfMovie::from_data(data, url.clone(), loader_url.clone(), load_bytes_info)?;
+                let avm1 = matches!(vm_data, MovieLoaderVMData::Avm1 { .. });
+                // AVM1 `loadMovie` of a URL already parsed and fully preloaded:
+                // share the movie (and thus its library) instead of redoing it.
+                let cacheable = avm1 && !from_bytes;
+                let cached = if cacheable {
+                    uc.library
+                        .preloaded_movie(&url)
+                        .filter(|movie| movie.compressed_len() == data.len())
+                } else {
+                    None
+                };
+                if let Some(movie) = cached {
+                    movie
+                } else {
+                    let mut movie = SwfMovie::from_data(
+                        data,
+                        url.clone(),
+                        loader_url.clone(),
+                        load_bytes_info,
+                    )?;
 
-                if matches!(vm_data, MovieLoaderVMData::Avm1 { .. }) {
-                    // If AVM1 loads a SWF, that SWF is always interpreted as
-                    // AVM1, regardless of what it declares in its header.
-                    movie.set_force_avm1();
+                    if avm1 {
+                        // If AVM1 loads a SWF, that SWF is always interpreted as
+                        // AVM1, regardless of what it declares in its header.
+                        movie.set_force_avm1();
+                    }
+
+                    let movie = Arc::new(movie);
+                    if cacheable {
+                        uc.library.cache_movie(url.clone(), movie.clone());
+                    }
+                    movie
                 }
-
-                Arc::new(movie)
             }
             ContentType::Gif | ContentType::Jpeg | ContentType::JpegXr | ContentType::Png => {
                 let (width, height) =
