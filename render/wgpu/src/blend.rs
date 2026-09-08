@@ -72,6 +72,9 @@ pub enum TrivialBlend {
     Add,
     Subtract,
     Screen,
+    /// Flash multiply against a backdrop known to be opaque; see
+    /// `WgpuCommandHandler::opaque` for when that holds.
+    Multiply,
 }
 
 impl TrivialBlend {
@@ -100,6 +103,17 @@ impl TrivialBlend {
                     src_factor: wgpu::BlendFactor::One,
                     dst_factor: wgpu::BlendFactor::One,
                     operation: wgpu::BlendOperation::ReverseSubtract,
+                },
+                alpha: wgpu::BlendComponent::OVER,
+            },
+            // The multiply shader computes src*(1-dst.a) + dst*(1-src.a) +
+            // src*dst; with dst.a == 1 the first term vanishes and the rest is
+            // expressible as blend factors.
+            TrivialBlend::Multiply => wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Dst,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
                 },
                 alpha: wgpu::BlendComponent::OVER,
             },

@@ -124,6 +124,10 @@ impl Surface {
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
     ) -> CommandTarget {
+        let opaque = matches!(
+            render_target_mode,
+            RenderTargetMode::FreshWithColor(color) if color.a >= 1.0
+        );
         let target = CommandTarget::new(
             descriptors,
             texture_pool,
@@ -148,6 +152,7 @@ impl Surface {
             target.width(),
             target.height(),
             self.origin,
+            opaque,
             match nearest_layer {
                 LayerRef::Current => LayerRef::Parent(&target),
                 layer => layer,
