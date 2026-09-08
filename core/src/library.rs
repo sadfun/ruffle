@@ -126,6 +126,9 @@ pub struct MovieLibrary<'gc> {
     jpeg_tables: Option<Vec<u8>>,
     fonts: FontMap<'gc>,
     avm2_domain: Option<Avm2Domain<'gc>>,
+    /// Set once a root clip of this movie has preloaded the whole tag stream,
+    /// i.e. every character the movie defines is registered here.
+    preloaded: bool,
 }
 
 impl<'gc> MovieLibrary<'gc> {
@@ -138,7 +141,16 @@ impl<'gc> MovieLibrary<'gc> {
             jpeg_tables: None,
             fonts: Default::default(),
             avm2_domain: None,
+            preloaded: false,
         }
+    }
+
+    pub fn preloaded(&self) -> bool {
+        self.preloaded
+    }
+
+    pub fn set_preloaded(&mut self) {
+        self.preloaded = true;
     }
 
     /// Registers a character; returns `true` if successful, or `false` if a character with
@@ -456,6 +468,12 @@ pub struct Library<'gc> {
     /// A list of the symbols associated with specific AVM2 constructor
     /// prototypes.
     avm2_class_registry: Avm2ClassRegistry<'gc>,
+
+    /// Movies loaded from a URL, keyed by that URL, so that loading the same
+    /// SWF again reuses the parsed movie and its fully preloaded library
+    /// instead of decompressing and re-defining every character.
+    // ponytail: unbounded; add an LRU by compressed bytes if long sessions grow.
+    movie_cache: HashMap<String, Arc<SwfMovie>>,
 }
 
 impl<'gc> Library<'gc> {
@@ -469,7 +487,21 @@ impl<'gc> Library<'gc> {
             default_font_names: Default::default(),
             default_font_cache: Default::default(),
             avm2_class_registry: Default::default(),
+            movie_cache: Default::default(),
         }
+    }
+
+    /// The movie previously loaded from `url`, if its library is fully preloaded.
+    pub fn preloaded_movie(&self, url: &str) -> Option<Arc<SwfMovie>> {
+        self.movie_cache
+            .get(url)
+            .filter(|movie| self.library_for_movie(Arc::clone(movie)).is_some_and(|l| l.preloaded()))
+            .cloned()
+    }
+
+    /// Remembers `movie` as the latest load of `url` (see `preloaded_movie`).
+    pub fn cache_movie(&mut self, url: String, movie: Arc<SwfMovie>) {
+        self.movie_cache.insert(url, movie);
     }
 
     pub fn library_for_movie(&self, movie: Arc<SwfMovie>) -> Option<&MovieLibrary<'gc>> {
