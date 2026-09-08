@@ -1556,7 +1556,12 @@ impl CommandHandler for WebGlRenderBackend {
         self.mask_state_dirty = true;
     }
 
-    fn blend(&mut self, commands: CommandList, blend: RenderBlendMode) {
+    fn blend(
+        &mut self,
+        commands: CommandList,
+        blend: RenderBlendMode,
+        _bounds: Option<swf::Rectangle<Twips>>,
+    ) {
         self.push_blend_mode(blend);
         commands.execute(self);
         self.pop_blend_mode();
