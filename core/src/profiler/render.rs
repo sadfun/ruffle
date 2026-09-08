@@ -311,7 +311,7 @@ impl CommandWalk<'_> {
                         union_into(&mut union, rect);
                     }
                 }
-                Command::Blend(inner, mode) => {
+                Command::Blend(inner, mode, _) => {
                     let kind = match mode {
                         RenderBlendMode::Builtin(swf::BlendMode::Layer) => {
                             self.stats.blend_layer += 1;

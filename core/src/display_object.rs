@@ -1167,7 +1167,16 @@ pub fn render_base<'gc>(
                 crate::profiler::inc(crate::profiler::Counter::LayerBlendsInlined);
                 context.commands.append(sub_commands);
             } else {
-                context.commands.blend(sub_commands, render_blend_mode);
+                // Device-space extent of the group, so the backend can size its
+                // offscreen pass to the object instead of the whole target.
+                let bounds = this.render_bounds_with_transform(
+                    &context.transform_stack.transform().matrix,
+                    true,
+                    &context.stage.view_matrix(),
+                );
+                context
+                    .commands
+                    .blend(sub_commands, render_blend_mode, Some(bounds));
             }
         }
     }
