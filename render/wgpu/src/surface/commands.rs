@@ -516,6 +516,7 @@ pub fn chunk_blends<'a>(
     width: u32,
     height: u32,
     origin: (u32, u32),
+    opaque: bool,
     nearest_layer: LayerRef,
     texture_pool: &mut TexturePool,
 ) -> Vec<Chunk> {
@@ -529,6 +530,7 @@ pub fn chunk_blends<'a>(
         width,
         height,
         origin,
+        opaque,
         nearest_layer,
         texture_pool,
     )
@@ -542,6 +544,12 @@ struct WgpuCommandHandler<'a> {
     height: u32,
     /// Global pixel position of the target's top-left (see `CommandTarget::origin`).
     origin: (u32, u32),
+    /// Every pixel of the target has alpha 1 so far: it was cleared with an
+    /// opaque colour and nothing drawn since could lower alpha. Normal, Add,
+    /// Screen and Subtract composite alpha as "over", the complex blend
+    /// shaders write src.a + dst.a*(1-src.a), and mask draws write no colour,
+    /// so only Alpha/Erase, PixelBender blends and Stage3D clear this.
+    opaque: bool,
     nearest_layer: LayerRef<'a>,
     meshes: &'a Vec<Mesh>,
     staging_belt: &'a mut wgpu::util::StagingBelt,
@@ -569,6 +577,7 @@ impl<'a> WgpuCommandHandler<'a> {
         width: u32,
         height: u32,
         origin: (u32, u32),
+        opaque: bool,
         nearest_layer: LayerRef<'a>,
         texture_pool: &'a mut TexturePool,
     ) -> Self {
@@ -585,6 +594,7 @@ impl<'a> WgpuCommandHandler<'a> {
             width,
             height,
             origin,
+            opaque,
             nearest_layer,
             meshes,
             staging_belt,
@@ -693,7 +703,15 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         } else {
             self.nearest_layer
         };
-        let blend_type = BlendType::from(blend_mode);
+        let blend_type = match BlendType::from(blend_mode) {
+            // Against an opaque backdrop multiply is a plain blend state, which
+            // composites inside the current render pass instead of snapshotting
+            // the parent for the shader.
+            BlendType::Complex(ComplexBlend::Multiply) if self.opaque => {
+                BlendType::Trivial(TrivialBlend::Multiply)
+            }
+            other => other,
+        };
         let clear_color = blend_type.default_color();
         let whole = PixelRegion::for_region(self.origin.0, self.origin.1, self.width, self.height);
         // PixelBender blends sample the whole frame, so they stay full-size.
@@ -801,6 +819,14 @@ impl CommandHandler for WgpuCommandHandler<'_> {
                 }
                 self.transforms
                     .set_buffer_limit(self.dynamic_transforms.buffer.size());
+                let keeps_alpha = matches!(
+                    blend_type,
+                    BlendType::Complex(complex)
+                        if !matches!(complex, ComplexBlend::Alpha | ComplexBlend::Erase)
+                );
+                if !keeps_alpha {
+                    self.opaque = false;
+                }
                 let chunk_blend_mode = match blend_type {
                     BlendType::Complex(complex) => ChunkBlendMode::Complex(complex),
                     BlendType::Shader(shader) => ChunkBlendMode::Shader(shader),
@@ -844,6 +870,8 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         });
     }
     fn render_stage3d(&mut self, bitmap: BitmapHandle, transform: Transform) {
+        // Stage3D output carries whatever alpha the context wrote.
+        self.opaque = false;
         let mut matrix = transform.matrix;
         {
             let texture = as_texture(&bitmap);
