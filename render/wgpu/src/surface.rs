@@ -3,6 +3,7 @@ pub mod target;
 
 use crate::backend::RenderTargetMode;
 use crate::blend::ComplexBlend;
+use crate::buffer_builder::BufferBuilder;
 use crate::buffer_pool::TexturePool;
 use crate::dynamic_transforms::DynamicTransforms;
 use crate::filters::FilterSource;
@@ -11,7 +12,7 @@ use crate::pixel_bender::{ShaderMode, run_pixelbender_shader_impl};
 use crate::surface::commands::{Chunk, CommandRenderer, chunk_blends};
 use crate::utils::run_copy_pipeline;
 use crate::utils::supported_sample_count;
-use crate::{Descriptors, MaskState, Pipelines};
+use crate::{Descriptors, MaskState, Pipelines, Transforms};
 use ruffle_render::commands::CommandList;
 use ruffle_render::pixel_bender_support::{ImageInputTexture, PixelBenderShaderArgument};
 use ruffle_render::quality::StageQuality;
@@ -27,6 +28,8 @@ use self::commands::ChunkBlendMode;
 #[derive(Debug)]
 pub struct Surface {
     size: wgpu::Extent3d,
+    /// Global pixel position of this surface's top-left (see `CommandTarget::origin`).
+    origin: (u32, u32),
     quality: StageQuality,
     sample_count: u32,
     pipelines: Arc<Pipelines>,
@@ -55,11 +58,17 @@ impl Surface {
         let pipelines = descriptors.pipelines(sample_count, frame_buffer_format);
         Self {
             size,
+            origin: (0, 0),
             quality,
             sample_count,
             pipelines,
             format: frame_buffer_format,
         }
+    }
+
+    pub fn with_origin(mut self, origin: (u32, u32)) -> Self {
+        self.origin = origin;
+        self
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -123,7 +132,8 @@ impl Surface {
             self.sample_count,
             render_target_mode,
             draw_encoder,
-        );
+        )
+        .with_origin(self.origin);
 
         let mut num_masks = 0;
         let mut mask_state = MaskState::NoMask;
@@ -137,6 +147,7 @@ impl Surface {
             self.quality,
             target.width(),
             target.height(),
+            self.origin,
             match nearest_layer {
                 LayerRef::Current => LayerRef::Parent(&target),
                 layer => layer,
@@ -198,10 +209,11 @@ impl Surface {
                     texture,
                     blend_mode: ChunkBlendMode::Shader(shader),
                     needs_stencil,
+                    region,
                 } => {
                     assert!(!needs_stencil, "Shader blend mode not implemented in masks");
                     let parent_blend_buffer =
-                        target.update_blend_buffer(descriptors, texture_pool, draw_encoder);
+                        target.update_blend_buffer(descriptors, texture_pool, draw_encoder, region);
                     run_pixelbender_shader_impl(
                         descriptors,
                         shader,
@@ -234,6 +246,7 @@ impl Surface {
                     texture,
                     blend_mode: ChunkBlendMode::Complex(blend_mode),
                     needs_stencil,
+                    region,
                 } => {
                     let parent = match blend_mode {
                         ComplexBlend::Alpha | ComplexBlend::Erase => {
@@ -250,7 +263,25 @@ impl Surface {
                     };
 
                     let parent_blend_buffer =
-                        parent.update_blend_buffer(descriptors, texture_pool, draw_encoder);
+                        parent.update_blend_buffer(descriptors, texture_pool, draw_encoder, region);
+
+                    // The blend quad covers only the group's region of this
+                    // target; both textures it samples are region-sized.
+                    let local = target.local_region(region);
+                    let mut quad = BufferBuilder::new_for_uniform(&descriptors.limits);
+                    quad.set_buffer_limit(dynamic_transforms.buffer.size());
+                    quad.add(&[Transforms {
+                        world_matrix: [
+                            [local.width() as f32, 0.0, 0.0, 0.0],
+                            [0.0, local.height() as f32, 0.0, 0.0],
+                            [0.0, 0.0, 1.0, 0.0],
+                            [local.x_min as f32, local.y_min as f32, 0.0, 1.0],
+                        ],
+                        mult_color: [1.0, 1.0, 1.0, 1.0],
+                        add_color: [0.0, 0.0, 0.0, 0.0],
+                    }])
+                    .expect("a single transform fits an empty uniform buffer");
+                    quad.copy_to(staging_belt, draw_encoder, &dynamic_transforms.buffer);
 
                     let blend_bind_group =
                         descriptors
@@ -333,7 +364,7 @@ impl Surface {
                         );
                     }
 
-                    render_pass.set_bind_group(1, target.whole_frame_bind_group(descriptors), &[0]);
+                    render_pass.set_bind_group(1, &dynamic_transforms.bind_group, &[0]);
                     render_pass.set_bind_group(2, &blend_bind_group, &[]);
 
                     render_pass.set_vertex_buffer(0, descriptors.quad.vertices_pos.slice(..));

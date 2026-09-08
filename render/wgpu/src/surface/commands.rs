@@ -18,7 +18,7 @@ use ruffle_render::pixel_bender::PixelBenderShaderHandle;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::transform::Transform;
 use std::mem;
-use swf::{BlendMode, Color, ColorTransform, Twips};
+use swf::{BlendMode, Color, ColorTransform, Rectangle, Twips};
 use wgpu::Backend;
 use wgpu_profiler::Scope;
 
@@ -421,6 +421,8 @@ pub enum Chunk {
         texture: PoolOrArcTexture,
         blend_mode: ChunkBlendMode,
         needs_stencil: bool,
+        /// Global-pixel region the blend covers; `texture` is exactly this size.
+        region: PixelRegion,
     },
 }
 
@@ -509,6 +511,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
     quality: StageQuality,
     width: u32,
     height: u32,
+    origin: (u32, u32),
     nearest_layer: LayerRef,
     texture_pool: &'encoder mut TexturePool,
 ) -> Vec<Chunk> {
@@ -521,6 +524,7 @@ pub fn chunk_blends<'encoder, 'global: 'encoder>(
         quality,
         width,
         height,
+        origin,
         nearest_layer,
         texture_pool,
     )
@@ -532,6 +536,8 @@ struct WgpuCommandHandler<'encoder, 'global: 'encoder> {
     quality: StageQuality,
     width: u32,
     height: u32,
+    /// Global pixel position of the target's top-left (see `CommandTarget::origin`).
+    origin: (u32, u32),
     nearest_layer: LayerRef<'encoder>,
     meshes: &'encoder Vec<Mesh>,
     staging_belt: &'encoder mut wgpu::util::StagingBelt,
@@ -559,6 +565,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
         quality: StageQuality,
         width: u32,
         height: u32,
+        origin: (u32, u32),
         nearest_layer: LayerRef<'encoder>,
         texture_pool: &'encoder mut TexturePool,
     ) -> Self {
@@ -575,6 +582,7 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
             quality,
             width,
             height,
+            origin,
             nearest_layer,
             meshes,
             staging_belt,
@@ -663,8 +671,8 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
                 [matrix.c, matrix.d, 0.0, 0.0],
                 [0.0, 0.0, 1.0, 0.0],
                 [
-                    matrix.tx.to_pixels() as f32,
-                    matrix.ty.to_pixels() as f32,
+                    matrix.tx.to_pixels() as f32 - self.origin.0 as f32,
+                    matrix.ty.to_pixels() as f32 - self.origin.1 as f32,
                     0.0,
                     1.0,
                 ],
@@ -711,14 +719,12 @@ impl<'encoder, 'global: 'encoder> WgpuCommandHandler<'encoder, 'global> {
 }
 
 impl CommandHandler for WgpuCommandHandler<'_, '_> {
-    fn blend(&mut self, commands: CommandList, blend_mode: RenderBlendMode) {
-        let surface = Surface::new(
-            self.descriptors,
-            self.quality,
-            self.width,
-            self.height,
-            wgpu::TextureFormat::Rgba8Unorm,
-        );
+    fn blend(
+        &mut self,
+        commands: CommandList,
+        blend_mode: RenderBlendMode,
+        bounds: Option<Rectangle<Twips>>,
+    ) {
         let target_layer = if let RenderBlendMode::Builtin(BlendMode::Layer) = &blend_mode {
             LayerRef::Current
         } else {
@@ -726,6 +732,24 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         };
         let blend_type = BlendType::from(blend_mode);
         let clear_color = blend_type.default_color();
+        let whole = PixelRegion::for_region(self.origin.0, self.origin.1, self.width, self.height);
+        // PixelBender blends sample the whole frame, so they stay full-size.
+        let region = match (&blend_type, bounds) {
+            (BlendType::Shader(_), _) | (_, None) => whole,
+            (_, Some(bounds)) => match blend_region(&bounds, &whole) {
+                Some(region) => region,
+                // The group cannot touch this target.
+                None => return,
+            },
+        };
+        let surface = Surface::new(
+            self.descriptors,
+            self.quality,
+            region.width(),
+            region.height(),
+            wgpu::TextureFormat::Rgba8Unorm,
+        )
+        .with_origin((region.x_min, region.y_min));
         let target = surface.draw_commands(
             RenderTargetMode::FreshWithColor(clear_color),
             self.descriptors,
@@ -754,7 +778,11 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
         match blend_type {
             BlendType::Trivial(blend_mode) => {
                 let transform = Transform {
-                    matrix: Matrix::scale(target.width() as f32, target.height() as f32),
+                    matrix: Matrix {
+                        tx: Twips::from_pixels_i32(region.x_min as i32),
+                        ty: Twips::from_pixels_i32(region.y_min as i32),
+                        ..Matrix::scale(target.width() as f32, target.height() as f32)
+                    },
                     color_transform: Default::default(),
                     perspective_projection: None,
                 };
@@ -813,6 +841,7 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                     texture: target.take_color_texture(),
                     blend_mode: chunk_blend_mode,
                     needs_stencil: self.num_masks > 0,
+                    region,
                 });
                 self.needs_stencil = self.num_masks > 0;
             }
@@ -964,7 +993,8 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             self.width,
             self.height,
             wgpu::TextureFormat::Rgba8Unorm,
-        );
+        )
+        .with_origin(self.origin);
 
         let maskee = surface.draw_commands(
             RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
@@ -978,7 +1008,11 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
             self.texture_pool,
         );
         maskee.ensure_cleared(self.draw_encoder);
-        let matrix = Matrix::scale(maskee.width() as f32, maskee.height() as f32);
+        let matrix = Matrix {
+            tx: Twips::from_pixels_i32(self.origin.0 as i32),
+            ty: Twips::from_pixels_i32(self.origin.1 as i32),
+            ..Matrix::scale(maskee.width() as f32, maskee.height() as f32)
+        };
         let maskee = maskee.take_color_texture();
 
         let mask = surface.draw_commands(
@@ -1027,5 +1061,60 @@ impl CommandHandler for WgpuCommandHandler<'_, '_> {
                 transform_buffer,
             }
         });
+    }
+}
+
+/// Device-pixel footprint of a blend group on the target `whole` (global
+/// pixels): the bounds snapped outwards, padded to a 16px grid so the texture
+/// pool sees few distinct sizes, and clipped to the target. `None` when the
+/// group cannot touch the target; `whole` when the bounds are degenerate.
+fn blend_region(bounds: &Rectangle<Twips>, whole: &PixelRegion) -> Option<PixelRegion> {
+    if !bounds.is_valid() {
+        return Some(*whole);
+    }
+    let clamp_x = |v: f64| v.clamp(whole.x_min as f64, whole.x_max as f64) as u32;
+    let clamp_y = |v: f64| v.clamp(whole.y_min as f64, whole.y_max as f64) as u32;
+    let x_min = clamp_x(bounds.x_min.to_pixels().floor());
+    let y_min = clamp_y(bounds.y_min.to_pixels().floor());
+    let x_max = clamp_x(bounds.x_max.to_pixels().ceil());
+    let y_max = clamp_y(bounds.y_max.to_pixels().ceil());
+    if x_max <= x_min || y_max <= y_min {
+        return None;
+    }
+    let pad = |lo: u32, hi: u32, limit: u32| (lo + (hi - lo).next_multiple_of(16)).min(limit);
+    Some(PixelRegion {
+        x_min,
+        y_min,
+        x_max: pad(x_min, x_max, whole.x_max),
+        y_max: pad(y_min, y_max, whole.y_max),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Rectangle<Twips> {
+        Rectangle {
+            x_min: Twips::from_pixels(x0),
+            x_max: Twips::from_pixels(x1),
+            y_min: Twips::from_pixels(y0),
+            y_max: Twips::from_pixels(y1),
+        }
+    }
+
+    #[test]
+    fn blend_region_snaps_pads_and_clips() {
+        let whole = PixelRegion::for_region(100, 50, 200, 100);
+        // Fractional bounds snap outwards, then pad to 16px.
+        let r = blend_region(&rect(110.4, 60.6, 118.2, 63.1), &whole).unwrap();
+        assert_eq!((r.x_min, r.y_min, r.x_max, r.y_max), (110, 60, 126, 76));
+        // Padding never leaves the target.
+        let r = blend_region(&rect(290.0, 140.0, 299.0, 149.0), &whole).unwrap();
+        assert_eq!((r.x_max, r.y_max), (300, 150));
+        // Fully outside (left of the target) draws nothing.
+        assert!(blend_region(&rect(0.0, 0.0, 90.0, 40.0), &whole).is_none());
+        // Degenerate bounds fall back to the whole target.
+        assert_eq!(blend_region(&Rectangle::default(), &whole), Some(whole));
     }
 }
