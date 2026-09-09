@@ -88,3 +88,6 @@ ignored = [
     # Not used directly, declared only to enable its `wasm_js` feature on WASM.
     "getrandom"
 ]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+dlmalloc = { version = "0.2", default-features = false }
