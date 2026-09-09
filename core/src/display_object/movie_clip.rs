@@ -314,8 +314,10 @@ impl<'gc> MovieClip<'gc> {
     ) -> Self {
         let num_frames = movie.num_frames();
         let loader_info = None;
-        let shared =
+        let library_use = context.library.use_movie(movie.clone());
+        let mut shared =
             MovieClipShared::with_data(0, movie.into(), num_frames, loader_info, Some(parent));
+        shared.library_use = Some(library_use);
 
         let data = MovieClipData::new(shared, context.gc());
         data.flags.set(MovieClipFlags::PLAYING);
@@ -341,13 +343,14 @@ impl<'gc> MovieClip<'gc> {
             None
         };
 
-        let shared = MovieClipShared::with_data(
+        let mut shared = MovieClipShared::with_data(
             0,
             movie.clone().into(),
             movie.num_frames(),
             loader_info,
             None,
         );
+        shared.library_use = Some(activation.context.library.use_movie(movie.clone()));
         let data = MovieClipData::new(shared, activation.gc());
         data.flags.set(MovieClipFlags::PLAYING);
         data.base.base.set_is_root(true);
@@ -379,6 +382,7 @@ impl<'gc> MovieClip<'gc> {
         let movie =
             movie.unwrap_or_else(|| Arc::new(SwfMovie::empty(write.movie().version(), None)));
         let total_frames = movie.num_frames();
+        let library_use = context.library.use_movie(movie.clone());
         assert!(
             write.shared.get().loader_info.is_none(),
             "Called replace_movie on a clip with LoaderInfo set"
@@ -389,10 +393,10 @@ impl<'gc> MovieClip<'gc> {
 
         unlock!(write, MovieClipData, cell).borrow_mut().container = ChildContainer::new(&movie);
 
-        unlock!(write, MovieClipData, shared).set(Gc::new(
-            context.gc(),
-            MovieClipShared::with_data(0, movie.into(), total_frames, loader_info, None),
-        ));
+        let mut shared =
+            MovieClipShared::with_data(0, movie.into(), total_frames, loader_info, None);
+        shared.library_use = Some(library_use);
+        unlock!(write, MovieClipData, shared).set(Gc::new(context.gc(), shared));
         write.tag_stream_pos.set(0);
         write.flags.set(MovieClipFlags::PLAYING);
         write.current_frame.set(0);
@@ -4687,6 +4691,11 @@ struct MovieClipShared<'gc> {
 
     // If this movie was loaded from ImportAssets(2), this will be the root MovieClip of the parent movie.
     importer_movie: Option<MovieClip<'gc>>,
+
+    /// Set on root clips: keeps the movie's library alive while this clip is
+    /// (see `Library::use_movie`).
+    #[collect(require_static)]
+    library_use: Option<Arc<()>>,
 }
 
 #[derive(Default)]
@@ -4739,6 +4748,7 @@ impl<'gc> MovieClipShared<'gc> {
             avm2_class: Lock::new(None),
             loader_info,
             importer_movie,
+            library_use: None,
         }
     }
 

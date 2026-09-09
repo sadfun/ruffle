@@ -2387,8 +2387,22 @@ impl Player {
 
         // GC
         self.gc_arena.borrow_mut().collect_debt();
+        self.enter_arena_mut(|_, root, _| root.library.prune_unused_movies());
 
         rval
+    }
+
+    /// Runs a full garbage collection and frees the libraries of movies no root
+    /// clip plays any more.
+    pub fn collect_garbage(&mut self) {
+        {
+            let mut arena = self.gc_arena.borrow_mut();
+            // Objects that died after the current cycle started marking
+            // survive it; a second full cycle catches them.
+            arena.finish_cycle();
+            arena.finish_cycle();
+        }
+        self.enter_arena_mut(|_, root, _| root.library.prune_unused_movies());
     }
 
     pub fn flush_shared_objects(&mut self) {
