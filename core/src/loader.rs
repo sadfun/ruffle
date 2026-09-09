@@ -18,7 +18,7 @@ use crate::avm2::{
 };
 use crate::avm2_stub_method_context;
 use crate::backend::navigator::{
-    ErrorResponse, FetchReason, OwnedFuture, Request, SuccessResponse,
+    ErrorResponse, FetchReason, NavigationMethod, OwnedFuture, Request, SuccessResponse,
 };
 use crate::backend::ui::{
     DialogResultFuture, FileDialogResult, MultiDialogResultFuture, MultiFileDialogResult,
@@ -49,6 +49,10 @@ use slotmap::{SlotMap, new_key_type};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::collections::HashMap;
+use futures::future::{FutureExt, LocalBoxFuture, Shared};
 use std::time::Duration;
 use swf::read::{extract_swz, read_compression_type};
 use thiserror::Error;
@@ -513,6 +517,20 @@ impl Default for LoadManager<'_> {
     }
 }
 
+/// One SWF fetch, shared by every loader that asked for the same URL while
+/// it was in flight.
+type SharedSwfResponse = Rc<Result<(Vec<u8>, String, u16, bool), ErrorResponse>>;
+type SharedSwfFetch = Shared<LocalBoxFuture<'static, SharedSwfResponse>>;
+
+thread_local! {
+    /// In-flight `loadMovie` fetches keyed by (player, URL). Shararam enters
+    /// a room by loading the same avatar-rig URL once per avatar in one tick;
+    /// one HTTP request serves them all, and the browser's per-origin
+    /// connection limit stays free for the rest of the burst.
+    static INFLIGHT_SWF: RefCell<HashMap<(usize, String), SharedSwfFetch>> =
+        RefCell::new(HashMap::new());
+}
+
 async fn wait_for_full_response(
     response: OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse>,
 ) -> Result<(Vec<u8>, String, u16, bool), ErrorResponse> {
@@ -754,8 +772,6 @@ impl<'gc> MovieLoader<'gc> {
             let request_url = request.url().to_string();
             let resolved_url = player.lock().unwrap().navigator().resolve_url(&request_url);
 
-            let fetch = player.lock().unwrap().fetch(request, FetchReason::LoadSwf);
-
             let mut replacing_root_movie = false;
             player.lock().unwrap().update(|uc| -> Result<(), Error> {
                 let clip = match uc.load_manager.get_loader(handle) {
@@ -804,18 +820,65 @@ impl<'gc> MovieLoader<'gc> {
                 MovieLoader::movie_loader_start(handle, uc)
             })?;
 
-            let response = wait_for_full_response(fetch).await;
+            // Plain GETs of the same URL share one fetch (see INFLIGHT_SWF).
+            let dedupe_key = (request.method() == NavigationMethod::Get
+                && request.body().is_none())
+            .then(|| (Arc::as_ptr(&player) as usize, request_url.clone()));
+            let existing = dedupe_key
+                .as_ref()
+                .and_then(|key| INFLIGHT_SWF.with(|map| map.borrow().get(key).cloned()));
+            let shared = match existing {
+                Some(shared) => shared,
+                None => {
+                    let fetch = player.lock().unwrap().fetch(request, FetchReason::LoadSwf);
+                    let shared: LocalBoxFuture<'static, SharedSwfResponse> =
+                        Box::pin(async move { Rc::new(wait_for_full_response(fetch).await) });
+                    let shared = shared.shared();
+                    if let Some(key) = &dedupe_key {
+                        INFLIGHT_SWF.with(|map| map.borrow_mut().insert(key.clone(), shared.clone()));
+                    }
+                    shared
+                }
+            };
+            let response = shared.await;
+            if let Some(key) = &dedupe_key {
+                INFLIGHT_SWF.with(|map| map.borrow_mut().remove(key));
+            }
             let player = player.lock().unwrap();
-            match response {
+            match &*response {
                 Ok((body, url, status, redirected)) if replacing_root_movie => {
                     Self::on_success_root_movie(
-                        player, handle, loader_url, body, url, status, redirected,
+                        player,
+                        handle,
+                        loader_url,
+                        body.clone(),
+                        url.clone(),
+                        *status,
+                        *redirected,
                     )?;
                 }
                 Ok((body, url, status, redirected)) => {
-                    Self::on_success(player, handle, loader_url, body, url, status, redirected)?;
+                    Self::on_success(
+                        player,
+                        handle,
+                        loader_url,
+                        body.clone(),
+                        url.clone(),
+                        *status,
+                        *redirected,
+                    )?;
                 }
                 Err(response) => {
+                    let error = match &response.error {
+                        Error::HttpNotOk(message, status, redirected, length) => {
+                            Error::HttpNotOk(message.clone(), *status, *redirected, *length)
+                        }
+                        other => Error::FetchError(other.to_string()),
+                    };
+                    let response = ErrorResponse {
+                        url: response.url.clone(),
+                        error,
+                    };
                     Self::on_error(player, handle, response)?;
                 }
             }
