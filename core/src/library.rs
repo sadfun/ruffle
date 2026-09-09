@@ -129,6 +129,10 @@ pub struct MovieLibrary<'gc> {
     /// Set once a root clip of this movie has preloaded the whole tag stream,
     /// i.e. every character the movie defines is registered here.
     preloaded: bool,
+    /// Alive while a root clip playing this movie is alive (see `Library::use_movie`).
+    /// `None` for libraries no root clip ever claimed; those are kept forever.
+    #[collect(require_static)]
+    users: Option<Weak<()>>,
 }
 
 impl<'gc> MovieLibrary<'gc> {
@@ -142,6 +146,7 @@ impl<'gc> MovieLibrary<'gc> {
             fonts: Default::default(),
             avm2_domain: None,
             preloaded: false,
+            users: None,
         }
     }
 
@@ -435,6 +440,25 @@ impl<'gc> MovieLibraries<'gc> {
     fn known_movies(&self) -> impl Iterator<Item = Arc<SwfMovie>> {
         self.0.keys()
     }
+
+    fn contains(&self, movie: &Arc<SwfMovie>) -> bool {
+        self.0.contains_key(movie)
+    }
+
+    /// Removes the libraries `dead` is true for. Not `retain`: weak-table's
+    /// backward-shift deletion skips the bucket moved into a freed slot, so
+    /// `retain` misses one of two adjacent matches.
+    fn remove_where(&mut self, dead: impl Fn(&MovieLibrary<'gc>) -> bool) {
+        let dead: Vec<Arc<SwfMovie>> = self
+            .0
+            .iter()
+            .filter(|(_, library)| dead(library))
+            .map(|(movie, _)| movie)
+            .collect();
+        for movie in dead {
+            self.0.remove(&movie);
+        }
+    }
 }
 
 /// Symbol library for multiple movies.
@@ -495,13 +519,49 @@ impl<'gc> Library<'gc> {
     pub fn preloaded_movie(&self, url: &str) -> Option<Arc<SwfMovie>> {
         self.movie_cache
             .get(url)
-            .filter(|movie| self.library_for_movie(Arc::clone(movie)).is_some_and(|l| l.preloaded()))
+            .filter(|movie| {
+                self.library_for_movie(Arc::clone(movie))
+                    .is_some_and(|l| l.preloaded())
+            })
             .cloned()
     }
 
     /// Remembers `movie` as the latest load of `url` (see `preloaded_movie`).
     pub fn cache_movie(&mut self, url: String, movie: Arc<SwfMovie>) {
         self.movie_cache.insert(url, movie);
+    }
+
+    /// Claims `movie`'s library for a root clip. The token lives in that clip's
+    /// shared data; once every root clip of the movie has been collected, the
+    /// next `prune_unused_movies` drops the library.
+    ///
+    /// Without this nothing ever frees a loaded movie: the weak-keyed
+    /// `movie_libraries` map can only expire an entry when its `Arc<SwfMovie>`
+    /// is gone, but the entry's own `MovieLibrary` (and every character in it)
+    /// holds that `Arc`, so each `loadMovie` leaks its shapes, bitmaps, fonts
+    /// and sprite data for the lifetime of the player.
+    pub fn use_movie(&mut self, movie: Arc<SwfMovie>) -> Arc<()> {
+        let library = self.library_for_movie_mut(movie);
+        if let Some(token) = library.users.as_ref().and_then(Weak::upgrade) {
+            return token;
+        }
+        let token = Arc::new(());
+        library.users = Some(Arc::downgrade(&token));
+        token
+    }
+
+    /// Drops the libraries (and cached movies) of movies whose root clips have
+    /// all been collected. Cheap; runs after every garbage collection.
+    pub fn prune_unused_movies(&mut self) {
+        self.movie_libraries.remove_where(|library| {
+            library
+                .users
+                .as_ref()
+                .is_some_and(|users| users.strong_count() == 0)
+        });
+        let libraries = &self.movie_libraries;
+        self.movie_cache
+            .retain(|_, movie| libraries.contains(movie));
     }
 
     pub fn library_for_movie(&self, movie: Arc<SwfMovie>) -> Option<&MovieLibrary<'gc>> {
@@ -866,5 +926,160 @@ impl<'gc> FontMap<'gc> {
 
     pub fn all(&self) -> Vec<Font<'gc>> {
         self.0.values().copied().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::backend::navigator::{NullExecutor, NullNavigatorBackend};
+    use crate::tag_utils::{SwfMovie, movie_from_path};
+    use crate::{Player, PlayerBuilder};
+    use std::sync::{Arc, Mutex};
+    use swf::avm1::types::{Action, GetUrl2, Push, SendVarsMethod, Value};
+    use swf::{
+        Compression, Fixed8, Header, PlaceObject, PlaceObjectAction, Rectangle, Sprite, SwfStr,
+        Tag, Twips,
+    };
+
+    fn actions(actions: &[Action]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut writer = swf::avm1::write::Writer::new(&mut out, 8);
+            for action in actions {
+                writer.write_action(action).unwrap();
+            }
+            writer.write_action(&Action::End).unwrap();
+        }
+        out
+    }
+
+    fn swf(num_frames: u16, tags: &[Tag]) -> Vec<u8> {
+        let header = Header {
+            compression: Compression::None,
+            version: 8,
+            stage_size: Rectangle {
+                x_min: Twips::ZERO,
+                x_max: Twips::from_pixels(100.0),
+                y_min: Twips::ZERO,
+                y_max: Twips::from_pixels(100.0),
+            },
+            frame_rate: Fixed8::from_f32(24.0),
+            num_frames,
+        };
+        let mut out = Vec::new();
+        swf::write_swf(&header, tags, &mut out).unwrap();
+        out
+    }
+
+    fn get_url2(url: &str, target: &str) -> Vec<u8> {
+        actions(&[
+            Action::Push(Push {
+                values: vec![
+                    Value::Str(SwfStr::from_utf8_str(url)),
+                    Value::Str(SwfStr::from_utf8_str(target)),
+                ],
+            }),
+            Action::GetUrl2(GetUrl2::for_load_movie(SendVarsMethod::None)),
+        ])
+    }
+
+    fn known_movies(player: &Arc<Mutex<Player>>) -> Vec<Arc<SwfMovie>> {
+        player
+            .lock()
+            .unwrap()
+            .mutate_with_update_context(|context| context.library.known_movies().collect())
+    }
+
+    /// A movie loaded with `loadMovie` must not keep its library (characters,
+    /// shapes, bitmaps, fonts) alive after it has been unloaded.
+    #[test]
+    fn unloaded_movie_library_is_freed() {
+        let dir = std::env::temp_dir().join(format!("ruffle-library-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let child = swf(
+            1,
+            &[
+                Tag::DefineSprite(Sprite {
+                    id: 1,
+                    num_frames: 1,
+                    tags: vec![Tag::ShowFrame],
+                }),
+                Tag::ShowFrame,
+            ],
+        );
+        std::fs::write(dir.join("child.swf"), child).unwrap();
+        let load = get_url2("child.swf", "holder");
+        let unload = get_url2("", "holder");
+        let stop = actions(&[Action::Stop]);
+        let root = swf(
+            3,
+            &[
+                Tag::DefineSprite(Sprite {
+                    id: 1,
+                    num_frames: 1,
+                    tags: vec![Tag::ShowFrame],
+                }),
+                Tag::PlaceObject(Box::new(PlaceObject {
+                    version: 2,
+                    action: PlaceObjectAction::Place(1),
+                    depth: 1,
+                    matrix: None,
+                    color_transform: None,
+                    ratio: None,
+                    name: Some(SwfStr::from_utf8_str("holder")),
+                    clip_depth: None,
+                    class_name: None,
+                    filters: None,
+                    background_color: None,
+                    blend_mode: None,
+                    clip_actions: None,
+                    has_image: false,
+                    is_bitmap_cached: None,
+                    is_visible: None,
+                    amf_data: None,
+                })),
+                Tag::DoAction(&load),
+                Tag::ShowFrame,
+                Tag::ShowFrame,
+                Tag::DoAction(&unload),
+                Tag::DoAction(&stop),
+                Tag::ShowFrame,
+            ],
+        );
+        std::fs::write(dir.join("test.swf"), root).unwrap();
+
+        let mut executor = NullExecutor::new();
+        let navigator = NullNavigatorBackend::with_base_path(&dir, &executor).unwrap();
+        let movie = movie_from_path(dir.join("test.swf"), None).unwrap();
+        let player = PlayerBuilder::new()
+            .with_navigator(navigator)
+            .with_movie(movie)
+            .build();
+
+        // Frame 1 issues loadMovie; the fetch resolves on the executor.
+        player.lock().unwrap().run_frame();
+        executor.run();
+        player.lock().unwrap().run_frame();
+        executor.run();
+        // The load also registers a frameless placeholder movie under the
+        // same URL; the real child is the one with a frame.
+        let child = known_movies(&player)
+            .into_iter()
+            .find(|movie| movie.url().ends_with("child.swf") && movie.num_frames() == 1)
+            .expect("child.swf was never loaded");
+
+        // Frame 3 unloads it (root clips unload from a spawned future); a
+        // full collection must then drop the loaded movie's library.
+        player.lock().unwrap().run_frame();
+        executor.run();
+        player.lock().unwrap().collect_garbage();
+        assert!(
+            !known_movies(&player)
+                .iter()
+                .any(|movie| Arc::ptr_eq(movie, &child)),
+            "unloaded movie still has a library"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
