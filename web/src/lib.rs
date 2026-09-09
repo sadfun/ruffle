@@ -1,6 +1,8 @@
 #![deny(clippy::unwrap_used)]
 
 //! Ruffle web frontend.
+#[cfg(target_arch = "wasm32")]
+mod alloc;
 mod audio;
 mod builder;
 mod external_interface;
