@@ -2387,6 +2387,8 @@ impl<'gc> MovieClip<'gc> {
         } else if self.avm1_parent().is_none() {
             false
         } else if self.0.object1.get().is_some() {
+            crate::pick_stats::bump(crate::pick_stats::BUTTON_MODE_SLOW);
+            let _t = crate::pick_stats::timer(crate::pick_stats::T_BUTTON_MODE);
             Handler::BUTTON
                 .iter()
                 .any(|&handler| self.has_handler(context, handler))
@@ -2781,6 +2783,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
         point: Point<Twips>,
         options: HitTestOptions,
     ) -> bool {
+        crate::pick_stats::bump(crate::pick_stats::HIT_TEST_SHAPE);
         if options.contains(HitTestOptions::SKIP_INVISIBLE)
             && !self.visible()
             && self.maskee().is_none()
@@ -3094,6 +3097,8 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
             return None;
         }
 
+        crate::pick_stats::bump(crate::pick_stats::PICK_NODES);
+
         if self.visible() {
             let this: InteractiveObject<'gc> = self.into();
             let local_to_global = self.local_to_global_matrix();
@@ -3105,6 +3110,7 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
             let local_matrix = local_to_global.inverse()?;
 
             if let Some(masker) = self.masker() {
+                let _t = crate::pick_stats::timer(crate::pick_stats::T_MASKER);
                 // FIXME - should this really use `SKIP_INVISIBLE`? Avm2 doesn't.
                 if !masker.hit_test_shape(context, point, HitTestOptions::SKIP_INVISIBLE) {
                     return None;
@@ -3124,6 +3130,7 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
                 if is_button_mode {
                     let mut options = HitTestOptions::SKIP_INVISIBLE;
                     options.set(HitTestOptions::SKIP_MASK, self.maskee().is_none());
+                    let _t = crate::pick_stats::timer(crate::pick_stats::T_HIT_TEST_SHAPE);
                     if self.hit_test_shape(context, point, options) {
                         return Some(this);
                     }
