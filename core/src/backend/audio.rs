@@ -428,6 +428,7 @@ impl<'gc> AudioManager<'gc> {
                                 object,
                                 name: method_name,
                                 args: vec![],
+                                handler: None,
                             },
                             false,
                         );

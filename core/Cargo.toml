@@ -96,6 +96,8 @@ egui = ["dep:egui", "dep:egui_extras", "png"]
 jpegxr = ["dep:jpegxr", "ruffle_render/jpegxr", "lzma"]
 default_font = []
 serde = ["serde/derive"]
+# Recompute every cached pick bounds on use and panic if the cache is stale.
+pick_bounds_verify = []
 
 [build-dependencies]
 build_playerglobal = { path = "build_playerglobal" }

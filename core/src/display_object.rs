@@ -333,6 +333,17 @@ pub struct DisplayObjectBase<'gc> {
 
     /// Rectangle used for 9-slice scaling (`DisplayObject.scale9grid`).
     scaling_grid: Cell<Rectangle<Twips>>,
+
+    /// Cached `pick_bounds`; `None` when stale. See `TDisplayObject::pick_bounds`.
+    pick_bounds: Cell<Option<Rectangle<Twips>>>,
+
+    /// This clip's own `hitArea` may lie outside its subtree.
+    /// See `TDisplayObject::set_hit_area_unbounded`.
+    hit_area_unbounded: Cell<bool>,
+
+    /// Objects in this subtree, self included, with `hit_area_unbounded` set.
+    /// While non-zero `mouse_pick_avm1` does not prune this subtree by pick bounds.
+    unbounded_hit_areas: Cell<u32>,
 }
 
 #[derive(Clone)]
@@ -377,6 +388,9 @@ impl Default for DisplayObjectBase<'_> {
             scroll_rect: Cell::new(None),
             next_scroll_rect: Default::default(),
             scaling_grid: Default::default(),
+            pick_bounds: Cell::new(None),
+            hit_area_unbounded: Cell::new(false),
+            unbounded_hit_areas: Cell::new(0),
         }
     }
 }
@@ -957,6 +971,17 @@ struct DrawCacheInfo {
     bounds: Rectangle<Twips>,
     draw_offset: Point<i32>,
     filters: Vec<Filter>,
+}
+
+/// Adds `delta` to `unbounded_hit_areas` of `node` and its ancestors.
+fn adjust_unbounded_hit_areas(mut node: Option<DisplayObject<'_>>, delta: i32) {
+    while let Some(object) = node {
+        let count = &object.base().unbounded_hit_areas;
+        let new = count.get() as i32 + delta;
+        debug_assert!(new >= 0, "unbounded hit area count underflow");
+        count.set(new.max(0) as u32);
+        node = object.parent();
+    }
 }
 
 pub fn render_base<'gc>(
@@ -1851,6 +1876,8 @@ pub trait TDisplayObject<'gc>:
 
     #[no_dynamic]
     fn set_name(self, mc: &Mutation<'gc>, name: AvmString<'gc>) {
+        // A child named like a handler method counts as that property in AVM1.
+        crate::avm1::handlers::child_named(&name);
         DisplayObjectBase::set_name(Gc::write(mc, self.base()), name)
     }
 
@@ -1933,7 +1960,14 @@ pub trait TDisplayObject<'gc>:
     /// Set the parent of this display object.
     #[no_dynamic]
     fn set_parent(self, context: &mut UpdateContext<'gc>, parent: Option<DisplayObject<'gc>>) {
-        let had_parent = self.parent().is_some();
+        let old_parent = self.parent();
+        let had_parent = old_parent.is_some();
+        // The subtree takes its unbounded hit areas along.
+        let unbounded = self.base().unbounded_hit_areas.get() as i32;
+        if unbounded != 0 {
+            adjust_unbounded_hit_areas(old_parent, -unbounded);
+            adjust_unbounded_hit_areas(parent, unbounded);
+        }
         let write = Gc::write(context.gc(), self.base());
         DisplayObjectBase::set_parent_ignoring_orphan_list(write, parent);
         let parent_removed = had_parent && parent.is_none();
@@ -2471,8 +2505,13 @@ pub trait TDisplayObject<'gc>:
     fn pre_render(self, _context: &mut RenderContext<'_, 'gc>) {
         let this = self.base();
         this.clear_invalidate_flag();
-        this.scroll_rect
-            .set(this.has_scroll_rect().then(|| this.next_scroll_rect.get()));
+        let scroll_rect = this.has_scroll_rect().then(|| this.next_scroll_rect.get());
+        if this.scroll_rect.get() != scroll_rect {
+            this.scroll_rect.set(scroll_rect);
+            // The effective scroll rect is part of the pick bounds and of the
+            // matrix chain, and only takes effect here.
+            self.invalidate_pick_bounds();
+        }
     }
 
     fn render_self(self, _context: &mut RenderContext<'_, 'gc>) {}
@@ -2843,10 +2882,112 @@ pub trait TDisplayObject<'gc>:
         }
     }
 
+    /// Bounds of everything a mouse pick or `hitTest` could hit under this object, in
+    /// its own coordinate space: its own shape or drawing, every child of the render
+    /// list (visible or not, like `bounds_with_transform`), the hit-state children of
+    /// an AVM1 button, and the scroll rect. Cached per object; `invalidate_cached_bitmap`
+    /// drops it up the parent chain. This is a superset of the engine bounds (a child
+    /// contributes the AABB of its own AABB rather than its exactly transformed
+    /// bounds), which is what `mouse_pick_avm1` and `hit_test_shape` need to prune
+    /// subtrees without ever missing a hit; ActionScript's bounds keep using
+    /// `bounds_with_transform`.
+    #[no_dynamic]
+    fn pick_bounds(self) -> Rectangle<Twips> {
+        if let Some(bounds) = self.base().pick_bounds.get() {
+            #[cfg(feature = "pick_bounds_verify")]
+            {
+                let fresh = self.compute_pick_bounds();
+                if bounds != fresh {
+                    eprintln!(
+                        "STALE PICK BOUNDS on {} ({:?}): cached {:?} fresh {:?}",
+                        self.path(),
+                        self.movie().url(),
+                        bounds,
+                        fresh
+                    );
+                    self.base().pick_bounds.set(Some(fresh));
+                    return fresh;
+                }
+            }
+            return bounds;
+        }
+        let bounds = self.compute_pick_bounds();
+        self.base().pick_bounds.set(Some(bounds));
+        bounds
+    }
+
+    #[no_dynamic]
+    fn compute_pick_bounds(self) -> Rectangle<Twips> {
+        let mut bounds = self.self_bounds(BoundsMode::Engine);
+        if let Some(ctr) = self.as_container() {
+            for child in ctr.iter_render_list() {
+                let mut matrix = child.base().matrix();
+                if let Some(rect) = child.scroll_rect() {
+                    matrix *= Matrix::translate(-rect.x_min, -rect.y_min);
+                }
+                bounds = bounds.union(&(matrix * child.pick_bounds()));
+            }
+        }
+        if let Some(button) = self.as_avm1_button() {
+            bounds = bounds.union(&button.hit_area_pick_bounds());
+        }
+        if let Some(rect) = self.scroll_rect() {
+            bounds = bounds.union(&Rectangle {
+                x_min: Twips::ZERO,
+                y_min: Twips::ZERO,
+                x_max: rect.width(),
+                y_max: rect.height(),
+            });
+        }
+        bounds
+    }
+
+    /// Objects in this subtree, self included, whose `hitArea` may lie outside
+    /// their own subtree (see `set_hit_area_unbounded`).
+    #[no_dynamic]
+    fn unbounded_hit_areas(self) -> u32 {
+        self.base().unbounded_hit_areas.get()
+    }
+
+    /// Whether this clip's own `hitArea` may lie outside its subtree.
+    #[no_dynamic]
+    fn hit_area_unbounded(self) -> bool {
+        self.base().hit_area_unbounded.get()
+    }
+
+    /// Records whether this clip's `hitArea` may lie outside its subtree and
+    /// keeps `unbounded_hit_areas` of every ancestor in step. A hit area inside
+    /// the subtree is covered by the pick bounds (AVM1 cannot reparent a clip);
+    /// one outside is the only thing they can miss, so `mouse_pick_avm1` walks
+    /// the subtrees on the way to such an owner without pruning. Children
+    /// dropped together with their container (`replace_with_movie`) leave
+    /// their count on the ancestors, which only costs pruning.
+    #[no_dynamic]
+    fn set_hit_area_unbounded(self, unbounded: bool) {
+        if self.base().hit_area_unbounded.replace(unbounded) != unbounded {
+            adjust_unbounded_hit_areas(Some(self.into()), if unbounded { 1 } else { -1 });
+        }
+    }
+
+    /// Drops the cached pick bounds of this object and its ancestors. Stops at the
+    /// first object without a cache: a cached object always has cached descendants,
+    /// so an uncached one has no cached ancestors either.
+    #[no_dynamic]
+    fn invalidate_pick_bounds(self) {
+        let mut node = Some(self);
+        while let Some(object) = node {
+            if object.base().pick_bounds.take().is_none() {
+                break;
+            }
+            node = object.parent();
+        }
+    }
+
     /// Inform this object and its ancestors that it has visually changed and must be redrawn.
     /// If this object or any ancestor is marked as cacheAsBitmap, it will invalidate that cache.
     #[no_dynamic]
     fn invalidate_cached_bitmap(self) {
+        self.invalidate_pick_bounds();
         if self.base().invalidate_cached_bitmap() {
             // Don't inform ancestors if we've already done so this frame
             if let Some(parent) = self.parent() {
