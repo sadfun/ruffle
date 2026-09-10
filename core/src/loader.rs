@@ -1096,6 +1096,7 @@ pub fn load_form_into_object<'gc>(
                         object: that,
                         name: istr!("onData"),
                         args: vec![],
+                        handler: None,
                     },
                     false,
                 );
@@ -2504,6 +2505,7 @@ impl<'gc> MovieLoader<'gc> {
                                 istr!(strings, "onLoadInit").into(),
                                 self.target_clip.object1_or_undef(),
                             ],
+                            handler: None,
                         },
                         false,
                     );
