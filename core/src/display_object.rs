@@ -318,6 +318,9 @@ pub struct DisplayObjectBase<'gc> {
 
     /// Rectangle used for 9-slice scaling (`DisplayObject.scale9grid`).
     scaling_grid: Cell<Rectangle<Twips>>,
+
+    /// Cached `pick_bounds`; `None` when stale. See `TDisplayObject::pick_bounds`.
+    pick_bounds: Cell<Option<Rectangle<Twips>>>,
 }
 
 #[derive(Clone)]
@@ -362,6 +365,7 @@ impl Default for DisplayObjectBase<'_> {
             scroll_rect: Cell::new(None),
             next_scroll_rect: Default::default(),
             scaling_grid: Default::default(),
+            pick_bounds: Cell::new(None),
         }
     }
 }
@@ -1833,6 +1837,8 @@ pub trait TDisplayObject<'gc>:
 
     #[no_dynamic]
     fn set_name(self, mc: &Mutation<'gc>, name: AvmString<'gc>) {
+        // A child named like a handler method counts as that property in AVM1.
+        crate::avm1::handlers::child_named(&name);
         DisplayObjectBase::set_name(Gc::write(mc, self.base()), name)
     }
 
@@ -2453,8 +2459,13 @@ pub trait TDisplayObject<'gc>:
     fn pre_render(self, _context: &mut RenderContext<'_, 'gc>) {
         let this = self.base();
         this.clear_invalidate_flag();
-        this.scroll_rect
-            .set(this.has_scroll_rect().then(|| this.next_scroll_rect.get()));
+        let scroll_rect = this.has_scroll_rect().then(|| this.next_scroll_rect.get());
+        if this.scroll_rect.get() != scroll_rect {
+            this.scroll_rect.set(scroll_rect);
+            // The effective scroll rect is part of the pick bounds and of the
+            // matrix chain, and only takes effect here.
+            self.invalidate_pick_bounds();
+        }
     }
 
     fn render_self(self, _context: &mut RenderContext<'_, 'gc>) {}
@@ -2827,10 +2838,85 @@ pub trait TDisplayObject<'gc>:
         }
     }
 
+    /// Bounds of everything a mouse pick or `hitTest` could hit under this object, in
+    /// its own coordinate space: its own shape or drawing, every child of the render
+    /// list (visible or not, like `bounds_with_transform`), the hit-state children of
+    /// an AVM1 button, and the scroll rect. Cached per object; `invalidate_cached_bitmap`
+    /// drops it up the parent chain. This is a superset of the engine bounds (a child
+    /// contributes the AABB of its own AABB rather than its exactly transformed
+    /// bounds), which is what `mouse_pick_avm1` and `hit_test_shape` need to prune
+    /// subtrees without ever missing a hit; ActionScript's bounds keep using
+    /// `bounds_with_transform`.
+    #[no_dynamic]
+    fn pick_bounds(self) -> Rectangle<Twips> {
+        if let Some(bounds) = self.base().pick_bounds.get() {
+            #[cfg(feature = "pick_bounds_verify")]
+            {
+                let fresh = self.compute_pick_bounds();
+                if bounds != fresh {
+                    eprintln!(
+                        "STALE PICK BOUNDS on {} ({:?}): cached {:?} fresh {:?}",
+                        self.path(),
+                        self.movie().url(),
+                        bounds,
+                        fresh
+                    );
+                    self.base().pick_bounds.set(Some(fresh));
+                    return fresh;
+                }
+            }
+            return bounds;
+        }
+        let bounds = self.compute_pick_bounds();
+        self.base().pick_bounds.set(Some(bounds));
+        bounds
+    }
+
+    #[no_dynamic]
+    fn compute_pick_bounds(self) -> Rectangle<Twips> {
+        let mut bounds = self.self_bounds(BoundsMode::Engine);
+        if let Some(ctr) = self.as_container() {
+            for child in ctr.iter_render_list() {
+                let mut matrix = child.base().matrix();
+                if let Some(rect) = child.scroll_rect() {
+                    matrix *= Matrix::translate(-rect.x_min, -rect.y_min);
+                }
+                bounds = bounds.union(&(matrix * child.pick_bounds()));
+            }
+        }
+        if let Some(button) = self.as_avm1_button() {
+            bounds = bounds.union(&button.hit_area_pick_bounds());
+        }
+        if let Some(rect) = self.scroll_rect() {
+            bounds = bounds.union(&Rectangle {
+                x_min: Twips::ZERO,
+                y_min: Twips::ZERO,
+                x_max: rect.width(),
+                y_max: rect.height(),
+            });
+        }
+        bounds
+    }
+
+    /// Drops the cached pick bounds of this object and its ancestors. Stops at the
+    /// first object without a cache: a cached object always has cached descendants,
+    /// so an uncached one has no cached ancestors either.
+    #[no_dynamic]
+    fn invalidate_pick_bounds(self) {
+        let mut node = Some(self);
+        while let Some(object) = node {
+            if object.base().pick_bounds.take().is_none() {
+                break;
+            }
+            node = object.parent();
+        }
+    }
+
     /// Inform this object and its ancestors that it has visually changed and must be redrawn.
     /// If this object or any ancestor is marked as cacheAsBitmap, it will invalidate that cache.
     #[no_dynamic]
     fn invalidate_cached_bitmap(self) {
+        self.invalidate_pick_bounds();
         if self.base().invalidate_cached_bitmap() {
             // Don't inform ancestors if we've already done so this frame
             if let Some(parent) = self.parent() {

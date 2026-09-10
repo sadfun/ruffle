@@ -1,6 +1,7 @@
 use crate::avm1::activation::Activation;
 use crate::avm1::error::Error;
 use crate::avm1::function::{ExecutionName, ExecutionReason, FunctionObject};
+use crate::avm1::handlers;
 use crate::avm1::object::{NativeObject, stage_object};
 use crate::avm1::property::{Attribute, Property};
 use crate::avm1::property_map::{Entry, PropertyMap};
@@ -98,6 +99,9 @@ struct ObjectData<'gc> {
     properties: PropertyMap<'gc, Property<'gc>>,
     interfaces: Option<Vec<Object<'gc>>>,
     watchers: PropertyMap<'gc, Watcher<'gc>>,
+    /// Whether this object has ever been some object's `__proto__`
+    /// (see `avm1::handlers`).
+    is_prototype: std::cell::Cell<bool>,
 }
 
 impl fmt::Debug for Object<'_> {
@@ -111,6 +115,15 @@ impl fmt::Debug for Object<'_> {
 impl<'gc> Object<'gc> {
     pub fn as_weak(self) -> ObjectWeak<'gc> {
         ObjectWeak(Gc::downgrade(self.0))
+    }
+
+    /// Whether this object has ever been assigned as some object's `__proto__`.
+    pub fn is_prototype(self) -> bool {
+        self.0.borrow().is_prototype.get()
+    }
+
+    fn mark_prototype(self) {
+        self.0.borrow().is_prototype.set(true);
     }
 
     pub fn new(context: &StringContext<'gc>, proto: Option<impl Into<Value<'gc>>>) -> Self {
@@ -138,6 +151,7 @@ impl<'gc> Object<'gc> {
                 properties: PropertyMap::new(),
                 interfaces: None,
                 watchers: PropertyMap::new(),
+                is_prototype: std::cell::Cell::new(false),
             }),
         ));
         if let Some(proto) = proto {
@@ -161,6 +175,7 @@ impl<'gc> Object<'gc> {
                 properties: PropertyMap::new(),
                 interfaces: None,
                 watchers: PropertyMap::new(),
+                is_prototype: std::cell::Cell::new(false),
             }),
         ))
     }
@@ -317,7 +332,7 @@ impl<'gc> Object<'gc> {
             return Err(Error::ThrownValue(e));
         }
 
-        match self
+        let inserted = match self
             .0
             .borrow_mut(activation.gc())
             .properties
@@ -325,11 +340,21 @@ impl<'gc> Object<'gc> {
         {
             Entry::Occupied(mut entry) => {
                 entry.get_mut().set_data(value);
+                false
             }
             Entry::Vacant(entry) => {
                 entry.insert(Property::new_stored(value, Attribute::empty()));
+                true
             }
         };
+        if handlers::is_proto(&name) {
+            if let Value::Object(proto) = value {
+                proto.mark_prototype();
+            }
+            handlers::proto_changed(self);
+        } else if inserted {
+            handlers::property_changed(self, &name);
+        }
 
         Ok(())
     }
@@ -474,7 +499,7 @@ impl<'gc> Object<'gc> {
             return false;
         }
 
-        if let Entry::Occupied(mut entry) = self
+        let removed = if let Entry::Occupied(mut entry) = self
             .0
             .borrow_mut(activation.gc())
             .properties
@@ -482,9 +507,14 @@ impl<'gc> Object<'gc> {
             && entry.get().can_delete()
         {
             entry.remove_entry();
-            return true;
+            true
+        } else {
+            false
+        };
+        if removed {
+            handlers::property_changed(self, &name);
         }
-        false
+        removed
     }
 
     /// Define a virtual property onto a given object.
@@ -510,9 +540,18 @@ impl<'gc> Object<'gc> {
             return;
         }
 
-        match self.0.borrow_mut(gc_context).properties.entry(name, false) {
-            Entry::Occupied(mut entry) => entry.get_mut().set_virtual(getter, setter),
-            Entry::Vacant(entry) => entry.insert(Property::new_virtual(getter, setter, attributes)),
+        let inserted = match self.0.borrow_mut(gc_context).properties.entry(name, false) {
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().set_virtual(getter, setter);
+                false
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(Property::new_virtual(getter, setter, attributes));
+                true
+            }
+        };
+        if inserted {
+            handlers::property_changed(self, &name);
         }
     }
 
@@ -539,14 +578,23 @@ impl<'gc> Object<'gc> {
             return;
         }
 
-        match self
+        let inserted = match self
             .0
             .borrow_mut(activation.gc())
             .properties
             .entry(name, activation.is_case_sensitive())
         {
-            Entry::Occupied(mut entry) => entry.get_mut().set_virtual(getter, setter),
-            Entry::Vacant(entry) => entry.insert(Property::new_virtual(getter, setter, attributes)),
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().set_virtual(getter, setter);
+                false
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(Property::new_virtual(getter, setter, attributes));
+                true
+            }
+        };
+        if inserted {
+            handlers::property_changed(self, &name);
         }
     }
 
@@ -668,11 +716,22 @@ impl<'gc> Object<'gc> {
             return;
         }
 
-        self.0.borrow_mut(gc_context).properties.insert(
-            name.into(),
+        let name = name.into();
+        let previous = self.0.borrow_mut(gc_context).properties.insert(
+            name,
             Property::new_stored(value, attributes),
             true,
         );
+        if handlers::is_proto(&name) {
+            if let Value::Object(proto) = value {
+                proto.mark_prototype();
+            }
+            if previous.is_some() {
+                handlers::proto_changed(self);
+            }
+        } else if previous.is_none() {
+            handlers::property_changed(self, &name);
+        }
     }
 
     /// Set the attributes of a given property.

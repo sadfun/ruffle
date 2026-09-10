@@ -6,6 +6,7 @@ mod test_utils;
 
 #[macro_use]
 mod function;
+pub mod handlers;
 #[macro_use]
 mod property_decl;
 

@@ -63,6 +63,15 @@ struct Avm1ButtonDataMut<'gc> {
 }
 
 impl<'gc> Avm1Button<'gc> {
+    /// Union of the hit-state children's pick bounds, in the button's local space.
+    pub fn hit_area_pick_bounds(self) -> Rectangle<Twips> {
+        let mut bounds = Rectangle::default();
+        for child in self.0.cell.borrow().hit_area.values() {
+            bounds = bounds.union(&(child.base().matrix() * child.pick_bounds()));
+        }
+        bounds
+    }
+
     pub fn from_swf_tag(button: &swf::Button, source_movie: &SwfSlice, mc: &Mutation<'gc>) -> Self {
         let actions = button
             .actions
@@ -507,6 +516,7 @@ impl<'gc> TInteractiveObject<'gc> for Avm1Button<'gc> {
                         object: self.0.object.get().unwrap(),
                         name,
                         args: vec![],
+                        handler: None,
                     },
                     false,
                 );
@@ -540,7 +550,10 @@ impl<'gc> TInteractiveObject<'gc> for Avm1Button<'gc> {
         require_button_mode: bool,
     ) -> Option<InteractiveObject<'gc>> {
         // The button is hovered if the mouse is over any child nodes.
-        if self.visible() && self.mouse_enabled() {
+        if self.visible()
+            && self.mouse_enabled()
+            && (self.local_to_global_matrix() * self.pick_bounds()).contains(point)
+        {
             for child in self.iter_render_list().rev() {
                 let result = child
                     .as_interactive()

@@ -4,6 +4,7 @@ use crate::PlayerMode;
 use crate::avm_rng::AvmRng;
 use crate::avm1::Attribute;
 use crate::avm1::Avm1;
+use crate::avm1::handlers::Handler;
 use crate::avm1::{Object as Avm1Object, Value as Avm1Value};
 use crate::avm2::Activation as Avm2Activation;
 use crate::avm2::api_version::ApiVersion;
@@ -669,6 +670,10 @@ pub enum ActionType<'gc> {
         object: Avm1Object<'gc>,
         name: AvmString<'gc>,
         args: Vec<Avm1Value<'gc>>,
+        /// The clip event handler this is, if its presence is cached
+        /// (see `avm1::handlers`): a known-absent handler is not looked up.
+        #[collect(require_static)]
+        handler: Option<Handler>,
     },
 
     /// A system listener method.
@@ -708,7 +713,9 @@ impl fmt::Debug for ActionType<'_> {
                 .field("constructor", constructor)
                 .field("events", events)
                 .finish(),
-            ActionType::Method { object, name, args } => f
+            ActionType::Method {
+                object, name, args, ..
+            } => f
                 .debug_struct("ActionType::Method")
                 .field("object", object)
                 .field("name", name)

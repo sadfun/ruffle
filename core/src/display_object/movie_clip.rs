@@ -3,6 +3,7 @@ use crate::avm1::ActivationIdentifier as Avm1ActivationIdentifier;
 use crate::avm1::Avm1;
 use crate::avm1::ExecutionReason as Avm1ExecutionReason;
 use crate::avm1::globals::AVM_DEPTH_BIAS;
+use crate::avm1::handlers::{self, Handler, HandlerCache};
 use crate::avm1::{Activation as Avm1Activation, ActivationIdentifier};
 use crate::avm1::{NativeObject as Avm1NativeObject, Object as Avm1Object};
 use crate::avm2::Activation as Avm2Activation;
@@ -216,6 +217,11 @@ pub struct MovieClipData<'gc> {
     /// trigger on this clip rather than any input-eligible children.
     button_mode: Cell<bool>,
 
+    /// Which `onXxx` handler methods ActionScript defined for this clip,
+    /// remembered per name (see `avm1::handlers`).
+    #[collect(require_static)]
+    handler_cache: Cell<HandlerCache>,
+
     avm2_enabled: Cell<bool>,
 
     /// Show a hand cursor when the clip is in button mode.
@@ -256,6 +262,7 @@ impl<'gc> MovieClipData<'gc> {
             last_queued_script_frame: Cell::new(None),
             queued_script_frame: Cell::new(0),
             has_pending_script: Cell::new(false),
+            handler_cache: Cell::new(HandlerCache::default()),
             queued_goto_frame: Cell::new(None),
             drop_target: Lock::new(None),
             queued_tags: Default::default(),
@@ -392,6 +399,9 @@ impl<'gc> MovieClip<'gc> {
         write.base.base.set_is_root(is_root);
 
         unlock!(write, MovieClipData, cell).borrow_mut().container = ChildContainer::new(&movie);
+        // The old children are gone without going through the container, so the
+        // ancestors' cached pick bounds (and cached bitmaps) must be dropped here.
+        self.invalidate_cached_bitmap();
 
         let mut shared =
             MovieClipShared::with_data(0, movie.into(), total_frames, loader_info, None);
@@ -2070,6 +2080,7 @@ impl<'gc> MovieClip<'gc> {
                     );
                     let write = Gc::write(activation.gc(), self.0);
                     unlock!(write, MovieClipData, object1).set(Some(object));
+                    self.0.handler_cache.set(HandlerCache::default());
 
                     if run_frame {
                         self.run_frame_avm1(activation.context);
@@ -2101,6 +2112,7 @@ impl<'gc> MovieClip<'gc> {
             );
             let write = Gc::write(context.gc(), self.0);
             unlock!(write, MovieClipData, object1).set(Some(object));
+            self.0.handler_cache.set(HandlerCache::default());
 
             if run_frame {
                 self.run_frame_avm1(context);
@@ -2374,23 +2386,51 @@ impl<'gc> MovieClip<'gc> {
             true
         } else if self.avm1_parent().is_none() {
             false
-        } else if let Some(object) = self.0.object1.get() {
-            let mut activation = Avm1Activation::from_nothing(
-                context,
-                ActivationIdentifier::root("[Mouse Pick]"),
-                self.avm1_root(),
-            );
-
-            ClipEvent::BUTTON_EVENT_METHODS
+        } else if self.0.object1.get().is_some() {
+            Handler::BUTTON
                 .iter()
-                .copied()
-                .any(|handler| {
-                    let handler = AvmString::new_utf8(activation.gc(), handler);
-                    object.has_property(&mut activation, handler)
-                })
+                .any(|&handler| self.has_handler(context, handler))
         } else {
             false
         }
+    }
+
+    /// Whether ActionScript defined the method for `handler` (`onEnterFrame`,
+    /// `onMouseMove`, …) on this clip or its prototype chain: the same
+    /// `has_property` test the dispatch used to make on every event, remembered
+    /// per clip until any object gains or loses a property with that name.
+    pub fn has_handler(self, context: &mut UpdateContext<'gc>, handler: Handler) -> bool {
+        let Some(object) = self.0.object1.get() else {
+            return false;
+        };
+        let mut cache = self.0.handler_cache.get();
+        if let Some(present) = cache.get(handler) {
+            return present;
+        }
+        let version = handlers::version(handler);
+        let name = handler.name(&context.strings);
+        let mut activation = Avm1Activation::from_nothing(
+            context,
+            ActivationIdentifier::root("[Handler Lookup]"),
+            self.avm1_root(),
+        );
+        let present = object.has_property(&mut activation, name);
+        cache.set(handler, present, version);
+        self.0.handler_cache.set(cache);
+        present
+    }
+
+    /// Drops the cached answer for `handler`: its property was added to or
+    /// removed from this clip's own object.
+    pub fn forget_handler(self, handler: Handler) {
+        let mut cache = self.0.handler_cache.get();
+        cache.forget(handler);
+        self.0.handler_cache.set(cache);
+    }
+
+    /// Drops every cached answer: this clip's object got a new `__proto__`.
+    pub fn forget_handlers(self) {
+        self.0.handler_cache.set(HandlerCache::default());
     }
 
     /// Remove all tags matching the given filter off the internal tag queue.
@@ -2752,8 +2792,9 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
             return false;
         }
 
-        if self.world_bounds(BoundsMode::Engine).contains(point) {
-            let Some(local_matrix) = self.global_to_local_matrix() else {
+        let local_to_global = self.local_to_global_matrix();
+        if (local_to_global * self.pick_bounds()).contains(point) {
+            let Some(local_matrix) = local_to_global.inverse() else {
                 return false;
             };
             if let Some(masker) = self.masker()
@@ -3032,6 +3073,7 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
                         object,
                         name,
                         args: vec![],
+                        handler: Handler::for_event(event),
                     },
                     event == ClipEvent::Unload,
                 );
@@ -3054,7 +3096,13 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
 
         if self.visible() {
             let this: InteractiveObject<'gc> = self.into();
-            let local_matrix = self.global_to_local_matrix()?;
+            let local_to_global = self.local_to_global_matrix();
+            // Nothing under this clip (children, button hit areas, own drawing) can be
+            // hit outside its pick bounds, so the whole subtree is pruned here.
+            if !(local_to_global * self.pick_bounds()).contains(point) {
+                return None;
+            }
+            let local_matrix = local_to_global.inverse()?;
 
             if let Some(masker) = self.masker() {
                 // FIXME - should this really use `SKIP_INVISIBLE`? Avm2 doesn't.
@@ -3068,7 +3116,7 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
             // true.
             // InteractiveObject.mouseEnabled:
             // "Any children of this instance on the display list are not affected."
-            if self.mouse_enabled() && self.world_bounds(BoundsMode::Engine).contains(point) {
+            if self.mouse_enabled() {
                 // This MovieClip operates in "button mode" if it has a mouse handler,
                 // either via on(..) or via property mc.onRelease, etc.
                 let is_button_mode = self.is_button_mode(context);
@@ -3082,8 +3130,8 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
                 }
             }
 
-            // Maybe we could skip recursing down at all if !world_bounds.contains(point),
-            // but a child button can have an invisible hit area outside the parent's bounds.
+            // Each child prunes itself against its own pick bounds, which include
+            // button hit areas lying outside the parent's visible bounds.
             let mut hit_depth = 0;
             let mut result = None;
             let mut options = HitTestOptions::SKIP_INVISIBLE;
