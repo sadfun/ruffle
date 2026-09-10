@@ -1442,6 +1442,7 @@ pub trait TDisplayObject<'gc>:
     ///
     /// The `mode` parameter indicates which kind of bounds to return.
     fn bounds_with_transform(self, matrix: &Matrix, mode: BoundsMode) -> Rectangle<Twips> {
+        crate::pick_stats::bump(crate::pick_stats::BOUNDS_NODES);
         // A scroll rect completely overrides an object's bounds,
         // and can even grow the bounding box to be larger than the actual content
         if let Some(scroll_rect) = self.scroll_rect() {
@@ -1540,9 +1541,11 @@ pub trait TDisplayObject<'gc>:
     /// Should only be used to implement 'Transform.concatenatedMatrix'
     #[no_dynamic]
     fn local_to_global_matrix_without_own_scroll_rect(self) -> Matrix {
+        crate::pick_stats::bump(crate::pick_stats::L2G_CALLS);
         let mut node = self.parent();
         let mut matrix = self.base().matrix();
         while let Some(display_object) = node {
+            crate::pick_stats::bump(crate::pick_stats::L2G_STEPS);
             // We want to transform to Stage-local coordinates,
             // so do *not* apply the Stage's matrix
             if display_object.as_stage().is_some() {
@@ -1570,6 +1573,7 @@ pub trait TDisplayObject<'gc>:
     /// `None` is returned if the object has zero scale.
     #[no_dynamic]
     fn global_to_local_matrix(self) -> Option<Matrix> {
+        crate::pick_stats::bump(crate::pick_stats::INVERSE);
         self.local_to_global_matrix().inverse()
     }
 

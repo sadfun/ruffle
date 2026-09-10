@@ -683,6 +683,14 @@ impl Player {
         self.mouse_in_stage = is_in;
     }
 
+    /// Runs one AVM1 mouse pick at the current mouse position and returns the
+    /// path of the picked object. For `core/examples/pickbench.rs`.
+    pub fn bench_mouse_pick(&mut self) -> Option<String> {
+        self.mutate_with_update_context(|context| {
+            run_mouse_pick(context, true).map(|o| o.as_displayobject().path().to_string())
+        })
+    }
+
     pub fn mouse_cursor(&self) -> MouseCursor {
         self.mouse_cursor
     }

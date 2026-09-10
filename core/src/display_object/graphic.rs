@@ -284,6 +284,7 @@ impl<'gc> TDisplayObject<'gc> for Graphic<'gc> {
             let Some(local_matrix) = self.global_to_local_matrix() else {
                 return false;
             };
+            crate::pick_stats::bump(crate::pick_stats::SHAPE_TESTS);
             let point = local_matrix * point;
             if let Some(drawing) = self.0.drawing.get() {
                 if drawing.borrow().hit_test(point, &local_matrix) {

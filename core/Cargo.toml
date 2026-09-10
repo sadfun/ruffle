@@ -99,6 +99,8 @@ serde = ["serde/derive"]
 # Shararam profiling build: records frame/render/load/RTMP events for the
 # external profiler viewer. Off by default; see core/src/profiler.rs.
 shararam_profiler = []
+# Mouse-pick benchmark counters (core/examples/pickbench.rs).
+pick_stats = []
 # Recompute every cached pick bounds on use and panic if the cache is stale.
 pick_bounds_verify = []
 
