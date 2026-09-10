@@ -2211,8 +2211,24 @@ impl Player {
                     }
                 }
                 // Event handler method call (e.g. onEnterFrame).
-                ActionType::Method { object, name, args } => {
-                    Avm1::run_stack_frame_for_method(action.clip, object, name, &args, context);
+                ActionType::Method {
+                    object,
+                    name,
+                    args,
+                    handler,
+                } => {
+                    // The name is resolved now, not when the event was dispatched
+                    // (a constructor may have run in between). A handler the clip
+                    // is known not to have resolves to nothing: skip the lookup.
+                    let absent = handler.is_some_and(|handler| {
+                        action.clip.as_movie_clip().is_some_and(|clip| {
+                            clip.object1().is_some_and(|o| Object::ptr_eq(o, object))
+                                && !clip.has_handler(context, handler)
+                        })
+                    });
+                    if !absent {
+                        Avm1::run_stack_frame_for_method(action.clip, object, name, &args, context);
+                    }
                 }
 
                 // Event handler method call (e.g. onEnterFrame).
