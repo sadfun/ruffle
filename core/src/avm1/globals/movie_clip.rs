@@ -74,6 +74,7 @@ const PROTO_DECLS: StaticDeclarations = declare_static_properties! {
     "filters" => property(mc_getter!(filters), mc_setter!(set_filters); DONT_DELETE | DONT_ENUM | VERSION_8);
     "transform" => property(mc_getter!(transform), mc_setter!(set_transform); DONT_ENUM | VERSION_8);
     "blendMode" => property(mc_getter!(blend_mode), mc_setter!(set_blend_mode); DONT_DELETE | DONT_ENUM | VERSION_8);
+    "forceSmoothing" => property(mc_getter!(force_smoothing), mc_setter!(set_force_smoothing); DONT_DELETE | DONT_ENUM | VERSION_8);
     "scale9Grid" => property(mc_getter!(scale_9_grid), mc_setter!(set_scale_9_grid); DONT_DELETE | DONT_ENUM | VERSION_8);
     "getURL" => method(mc_method!(get_url); DONT_ENUM | DONT_DELETE);
     "unloadMovie" => method(mc_method!(unload_movie); DONT_ENUM | DONT_DELETE);
@@ -220,6 +221,26 @@ fn set_scale_9_grid<'gc>(
     } else {
         this.set_scaling_grid(Rectangle::default());
     };
+    Ok(())
+}
+
+fn force_smoothing<'gc>(
+    _this: MovieClip<'gc>,
+    _activation: &mut Activation<'_, 'gc>,
+) -> Result<Value<'gc>, Error<'gc>> {
+    // Flash Player never reports the value back.
+    Ok(Value::Undefined)
+}
+
+fn set_force_smoothing<'gc>(
+    this: MovieClip<'gc>,
+    activation: &mut Activation<'_, 'gc>,
+    value: Value<'gc>,
+) -> Result<(), Error<'gc>> {
+    // This only affects an image loaded into this clip, which the loader places at depth 1.
+    if let Some(bitmap) = this.child_by_depth(1).and_then(|child| child.as_bitmap()) {
+        bitmap.set_smoothing(value.as_bool(activation.swf_version()));
+    }
     Ok(())
 }
 
