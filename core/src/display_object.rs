@@ -2950,7 +2950,7 @@ pub trait TDisplayObject<'gc>:
     #[no_dynamic]
     fn set_hit_area_unbounded(self, unbounded: bool) {
         if self.base().hit_area_unbounded.replace(unbounded) != unbounded {
-            adjust_unbounded_hit_areas(Some(self.into()), if unbounded { 1 } else { -1 });
+            adjust_unbounded_hit_areas(Some(self), if unbounded { 1 } else { -1 });
         }
     }
 
