@@ -241,9 +241,13 @@ fn set_force_smoothing<'gc>(
     activation: &mut Activation<'_, 'gc>,
     value: Value<'gc>,
 ) -> Result<(), Error<'gc>> {
-    // This only affects an image loaded into this clip, which the loader places at depth 1.
+    let smoothing = value.as_bool(activation.swf_version());
+    // The shapes placed in this clip check this when they render.
+    this.set_force_smoothing(smoothing);
+    this.invalidate_cached_bitmap();
+    // An image loaded into this clip is a `Bitmap`, which the loader places at depth 1.
     if let Some(bitmap) = this.child_by_depth(1).and_then(|child| child.as_bitmap()) {
-        bitmap.set_smoothing(value.as_bool(activation.swf_version()));
+        bitmap.set_smoothing(smoothing);
     }
     Ok(())
 }
