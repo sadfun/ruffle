@@ -1,0 +1,15 @@
+num_frames = 30
+
+[image_comparisons.output]
+tolerance = 8
+
+# Flash Player does not smooth any bitmaps at low quality.
+[player_options]
+with_renderer = { optional = false, quality = "high" }
+
+[[compilers]]
+type = "Rascal"
+target = "test.swf"
+scripts = ["test.as"]
+swf_version = 9
+stage_rect = { x_max = 760.0, y_max = 100.0 }
