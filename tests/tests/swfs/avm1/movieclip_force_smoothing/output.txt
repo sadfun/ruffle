@@ -1,0 +1,11 @@
+own property of the prototype: true
+attached: undefined
+untouched: undefined
+early: undefined
+enabled: undefined
+after true: undefined
+disabled: undefined
+after false: undefined
+reloaded: undefined
+reloaded: undefined
+inner: undefined
